@@ -20,6 +20,7 @@ from easy_rtsp.exceptions import (
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "Stream": ("easy_rtsp.stream", "Stream"),
     "StreamState": ("easy_rtsp.types", "StreamState"),
+    "StreamStatus": ("easy_rtsp.types", "StreamStatus"),
     "PublishDestination": ("easy_rtsp.serve_url", "PublishDestination"),
     "parse_publish_destination": ("easy_rtsp.serve_url", "parse_publish_destination"),
     "configure_logging": ("easy_rtsp.log", "configure_logging"),
@@ -41,6 +42,7 @@ __all__ = [
     "SourceError",
     "Stream",
     "StreamState",
+    "StreamStatus",
 ]
 
 try:
@@ -69,4 +71,4 @@ if TYPE_CHECKING:
     from easy_rtsp.log import configure_logging, get_logger, setup_cli_logging
     from easy_rtsp.serve_url import PublishDestination, parse_publish_destination
     from easy_rtsp.stream import Stream
-    from easy_rtsp.types import StreamState
+    from easy_rtsp.types import StreamState, StreamStatus

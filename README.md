@@ -6,7 +6,7 @@
 
 Python library for ingesting video, transforming frames with NumPy/OpenCV, and republishing over **RTSP**, **RTSPS**, or **SRT** using FFmpeg, with optional **MediaMTX** for a proper RTSP server and **WebRTC** browser playback.
 
-**Status:** early development. See `plan.md` for scope and roadmap.
+**Status:** early development. See `ROADMAP.md` for scope and roadmap.
 
 ## Install
 

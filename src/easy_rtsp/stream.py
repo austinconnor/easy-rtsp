@@ -15,7 +15,7 @@ import numpy as np
 
 from easy_rtsp.backend import MediaMTXProcess, tcp_port_is_available, write_minimal_mediamtx_config
 from easy_rtsp.config import StreamConfig
-from easy_rtsp.exceptions import ConfigurationError, ProcessingError
+from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError
 from easy_rtsp.ffmpeg_util import probe_video, resolve_mediamtx
 from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
 from easy_rtsp.publish import start_publish_thread
@@ -25,7 +25,7 @@ from easy_rtsp.sources.frames import FrameGeneratorSource
 from easy_rtsp.sources.rtsp import RtspSource
 from easy_rtsp.sources.webcam import WebcamSource, probe_webcam_dimensions
 from easy_rtsp.log import get_logger
-from easy_rtsp.types import StreamState
+from easy_rtsp.types import StreamState, StreamStatus
 
 _logger = get_logger("stream")
 
@@ -52,10 +52,14 @@ class Stream:
         self._config = config if config is not None else source.config
         self._transform = transform
         self._state = StreamState.STOPPED
+        self._created_at = time.monotonic()
+        self._last_state_change_at = self._created_at
         self._publish_thread: threading.Thread | None = None
         self._backend: MediaMTXProcess | None = None
         self._publish_error: BaseException | None = None
         self._wait_event = threading.Event()
+        self._latest_frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
         self._serve_started = False
         self._viewer_url: str | None = None
         self._webrtc_play_url: str | None = None
@@ -64,7 +68,7 @@ class Stream:
             user_hook = self._config.on_reconnecting
 
             def _reconnect_hook(attempt: int) -> None:
-                self._state = StreamState.RECONNECTING
+                self._set_state(StreamState.RECONNECTING)
                 _logger.info("stream state -> reconnecting (attempt %s)", attempt)
                 if user_hook is not None:
                     user_hook(attempt)
@@ -82,6 +86,11 @@ class Stream:
     @property
     def state(self) -> StreamState:
         return self._state
+
+    @property
+    def serve_started(self) -> bool:
+        """Whether :meth:`serve` has been called successfully on this stream."""
+        return self._serve_started
 
     @property
     def config(self) -> StreamConfig:
@@ -105,6 +114,25 @@ class Stream:
         network, replace the host with this machine's LAN IP. ``None`` if WebRTC was not enabled.
         """
         return self._webrtc_play_url
+
+    def status(self) -> StreamStatus:
+        """Return an immutable snapshot of the stream's current health and lifecycle state."""
+        with self._latest_frame_lock:
+            latest_frame_available = self._latest_frame is not None
+        return StreamStatus(
+            state=self._state,
+            reconnect_count=self.reconnect_count,
+            serve_started=self._serve_started,
+            latest_frame_available=latest_frame_available,
+            viewer_url=self._viewer_url,
+            webrtc_play_url=self._webrtc_play_url,
+            publish_error=None if self._publish_error is None else str(self._publish_error),
+            created_at=self._created_at,
+            last_state_change_at=self._last_state_change_at,
+            publish_thread_alive=bool(
+                self._publish_thread is not None and self._publish_thread.is_alive()
+            ),
+        )
 
     @classmethod
     def open(cls, url: str, **kwargs: Any) -> Stream:
@@ -155,20 +183,62 @@ class Stream:
 
         return Stream(self._source, config=self._config, transform=composed)
 
+    def latest_frame(self, copy: bool = True) -> np.ndarray | None:
+        """
+        Return the most recent processed frame, or ``None`` if no frame has been produced yet.
+
+        When ``copy`` is true, return a defensive copy so callers can inspect or mutate the result
+        without affecting the cached frame.
+        """
+        with self._latest_frame_lock:
+            frame = self._latest_frame
+            if frame is None:
+                return None
+            return frame.copy() if copy else frame
+
+    def save_snapshot(self, path: str | Path) -> Path:
+        """
+        Save the latest processed frame to *path* and return the resolved destination path.
+
+        Uses OpenCV for image encoding when available. Raises a helpful error if no frame is
+        available yet or if OpenCV is not installed.
+        """
+        frame = self.latest_frame(copy=True)
+        if frame is None:
+            raise ProcessingError("No frame available yet to save a snapshot")
+
+        try:
+            import cv2  # type: ignore[import-untyped]
+        except ImportError as e:
+            raise DependencyError(
+                "OpenCV (cv2) is required to save snapshots. "
+                'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
+            ) from e
+
+        dest = Path(path).expanduser()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(dest), frame)
+        if not ok:
+            raise ProcessingError(f"Could not write snapshot to {dest}")
+        return dest
+
     def frames(self) -> Iterator[np.ndarray]:
         """Iterate decoded or generated frames (BGR ``uint8``)."""
         for frame in self._source.frames():
             if self._state in (StreamState.STOPPED, StreamState.RECONNECTING):
-                self._state = StreamState.RUNNING
+                self._set_state(StreamState.RUNNING)
             if self._transform is None:
-                yield frame
+                out = frame
             else:
                 try:
                     out = self._transform(frame)
                 except Exception as e:
                     raise ProcessingError("transform callback failed") from e
-                if out is not None:
-                    yield out
+                if out is None:
+                    continue
+            with self._latest_frame_lock:
+                self._latest_frame = out.copy()
+            yield out
 
     def serve(self, endpoint: str = "live", **kwargs: Any) -> Stream:
         """
@@ -252,7 +322,7 @@ class Stream:
         else:
             raise ConfigurationError(f"Unsupported serve() scheme: {dest.scheme!r}")
 
-        self._state = StreamState.RUNNING
+        self._set_state(StreamState.RUNNING)
         self._serve_started = True
 
         def factory() -> Iterator[np.ndarray]:
@@ -261,9 +331,9 @@ class Stream:
         def on_done(err: BaseException | None) -> None:
             self._publish_error = err
             if err is not None:
-                self._state = StreamState.ERROR
+                self._set_state(StreamState.ERROR)
             else:
-                self._state = StreamState.STOPPED
+                self._set_state(StreamState.STOPPED)
             self._wait_event.set()
             backend = self._backend
             self._backend = None
@@ -334,10 +404,10 @@ class Stream:
         if self._backend is not None:
             self._backend.stop()
             self._backend = None
-        self._state = StreamState.STOPPING
+        self._set_state(StreamState.STOPPING)
         if self._publish_thread and self._publish_thread.is_alive():
             self._publish_thread.join(timeout=20.0)
-        self._state = StreamState.STOPPED
+        self._set_state(StreamState.STOPPED)
         self._wait_event.set()
         self._config.ffmpeg_children.clear()
 
@@ -368,6 +438,10 @@ class Stream:
             w, h = probe_webcam_dimensions(s._index)
             return w, h, fps_default
         raise ConfigurationError(f"Unsupported source type for publish: {type(s)!r}")
+
+    def _set_state(self, state: StreamState) -> None:
+        self._state = state
+        self._last_state_change_at = time.monotonic()
 
 
 def _stream_config_from_kwargs(**kwargs: Any) -> StreamConfig:
