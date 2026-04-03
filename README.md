@@ -14,13 +14,30 @@ Python library for ingesting video, transforming frames with NumPy/OpenCV, and r
 pip install easy-rtsp
 ```
 
+For **webcam** capture, add the OpenCV extra (large wheel; skipped by default so installs stay quick):
+
+```bash
+pip install "easy-rtsp[webcam]"
+```
+
+Development from a clone: `uv sync --extra dev` (includes OpenCV for tests).
+
+## Releases
+
+Releases use Git tags plus GitHub Actions:
+
+- Run the **Cut Release** workflow with a version like `0.2.0`, or push a tag manually with `git tag -a v0.2.0 -m "Release v0.2.0" && git push origin v0.2.0`.
+- The **Release** workflow tests the repo, builds `sdist` and wheel, and publishes to PyPI.
+- Publishing uses PyPI Trusted Publishing, so configure a trusted publisher for this repository/workflow/environment in PyPI before the first release.
+- If this repository does not have a historical release tag yet, create a baseline tag such as `v0.1.0` before relying on tag-derived versions for future releases.
+
 ### Dependencies
 
 | Component | Role |
 |-----------|------|
 | **FFmpeg** / **ffprobe** | Required on `PATH` for decode/encode/publish. |
 | **MediaMTX** | Optional. Without it, loopback publish uses **MPEG-TS over TCP** (`tcp://127.0.0.1:PORT` in VLC), not `rtsp://`. |
-| **OpenCV** | Pulled in as `opencv-python-headless` for webcam capture. |
+| **OpenCV** | Optional extra `webcam`: `opencv-python-headless` for `Stream.from_webcam` only. |
 
 Download help (FFmpeg hints + optional MediaMTX binary for your OS):
 
@@ -156,6 +173,6 @@ easy-rtsp only ships **Python** code under the license above. At runtime it invo
 |-----------|-----------------|-------------------|
 | **FFmpeg** / **ffprobe** | [ffmpeg.org](https://ffmpeg.org/download.html), [FFmpeg legal](https://ffmpeg.org/legal.html) | Not MIT — typically **LGPL 2.1+** or **GPL** depending on build and enabled codecs; see upstream and your binary’s `LICENSE` / docs. |
 | **MediaMTX** (optional) | [bluenviron/mediamtx](https://github.com/bluenviron/mediamtx) | **MIT** |
-| **OpenCV** (Python bindings) | Pulled in as `opencv-python-headless`; [opencv.org](https://opencv.org/) | **Apache 2.0** (see the wheel / PyPI page for the exact package license). |
+| **OpenCV** (Python bindings) | Optional `easy-rtsp[webcam]` → `opencv-python-headless`; [opencv.org](https://opencv.org/) | **Apache 2.0** (see the wheel / PyPI page for the exact package license). |
 
 `easy-rtsp install-backends` may download a **MediaMTX** release from GitHub; it does **not** bundle FFmpeg — use official FFmpeg builds or your OS package manager and keep their license terms alongside any binaries you redistribute.

@@ -142,3 +142,9 @@ def test_context_manager_calls_stop() -> None:
         assert list(s.frames())
     assert stream is not None
     assert stream.state == StreamState.STOPPED
+
+
+def test_stop_unblocks_waiters_even_without_publish_thread() -> None:
+    s = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
+    s.stop()
+    assert s.wait(timeout=0.0)

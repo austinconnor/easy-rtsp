@@ -319,16 +319,27 @@ class Stream:
 
     def stop(self) -> None:
         """Stop publishing and any MediaMTX instance started by this stream."""
-        for proc in self._config.ffmpeg_children:
+        children = list(self._config.ffmpeg_children)
+        for proc in children:
             if proc is not None and proc.poll() is None:
                 proc.terminate()
+        # Give FFmpeg a moment to exit, then hard-kill anything still running (orphan/zombie guard).
+        time.sleep(0.25)
+        for proc in children:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
         if self._backend is not None:
             self._backend.stop()
             self._backend = None
         self._state = StreamState.STOPPING
         if self._publish_thread and self._publish_thread.is_alive():
-            self._publish_thread.join(timeout=15.0)
+            self._publish_thread.join(timeout=20.0)
         self._state = StreamState.STOPPED
+        self._wait_event.set()
+        self._config.ffmpeg_children.clear()
 
     def __enter__(self) -> Stream:
         return self

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import platform
 import stat
 import tarfile
 import urllib.error
@@ -23,12 +22,14 @@ INSTALL_MEDIAMTX_CLI = "easy-rtsp install-backends"
 
 def print_ffmpeg_install_hints() -> None:
     """Print OS-specific pointers; FFmpeg is not bundled."""
-    sys = platform.system()
+    import platform
+
+    system = platform.system()
     print("FFmpeg / ffprobe (required)")
     print("  Install a full build that includes ffprobe, and ensure both are on PATH.")
-    if sys == "Windows":
+    if system == "Windows":
         print("  Windows: https://www.gyan.dev/ffmpeg/builds/  or  winget install ffmpeg")
-    elif sys == "Darwin":
+    elif system == "Darwin":
         print("  macOS:    brew install ffmpeg")
     else:
         print("  Linux:    use your distro package (e.g. apt install ffmpeg) or a static build.")
@@ -37,17 +38,19 @@ def print_ffmpeg_install_hints() -> None:
 
 
 def _platform_asset_suffix() -> str:
-    sys = platform.system()
+    import platform
+
+    system = platform.system()
     machine = platform.machine().lower()
-    if sys == "Linux":
+    if system == "Linux":
         arch = "arm64" if machine in ("aarch64", "arm64") else "amd64"
         return f"linux_{arch}.tar.gz"
-    if sys == "Darwin":
+    if system == "Darwin":
         arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
         return f"darwin_{arch}.tar.gz"
-    if sys == "Windows":
+    if system == "Windows":
         return "windows_amd64.zip"
-    raise DependencyError(f"Unsupported platform for bundled MediaMTX download: {sys} {machine}")
+    raise DependencyError(f"Unsupported platform for bundled MediaMTX download: {system} {machine}")
 
 
 def _fetch_latest_mediamtx_release() -> dict[str, Any]:
@@ -116,6 +119,8 @@ def install_mediamtx(prefix: Path | None = None, *, dry_run: bool = False) -> Pa
 
     Returns the path to the ``mediamtx`` executable, or ``None`` if *dry_run*.
     """
+    import platform
+
     prefix = prefix or Path.home() / ".easy-rtsp"
     bin_dir = prefix / "bin"
     dest_bin = bin_dir / ("mediamtx.exe" if platform.system() == "Windows" else "mediamtx")

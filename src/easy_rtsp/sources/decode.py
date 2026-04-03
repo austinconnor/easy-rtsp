@@ -10,6 +10,7 @@ import numpy as np
 
 from easy_rtsp.exceptions import DependencyError, SourceError
 from easy_rtsp.ffmpeg_util import resolve_ffmpeg
+from easy_rtsp.process_io import decode_tail_bytes, discard_process, start_tail_reader
 
 
 def _ffmpeg_exit_ok(returncode: int | None, stderr: str) -> bool:
@@ -52,8 +53,12 @@ def iter_raw_bgr_frames(
         proc_holder.append(proc)
 
     assert proc.stdout is not None
+    assert proc.stderr is not None
+    stderr_tail, stderr_thread = start_tail_reader(
+        proc.stderr,
+        name="easy-rtsp-decode-stderr",
+    )
     frame_bytes = width * height * 3
-    stderr_data = b""
     try:
         while True:
             buf = proc.stdout.read(frame_bytes)
@@ -69,15 +74,15 @@ def iter_raw_bgr_frames(
         if proc.poll() is None:
             proc.terminate()
             killed_by_us = True
-        if proc.stderr:
-            stderr_data = proc.stderr.read() or b""
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
             killed_by_us = True
-        err = stderr_data.decode("utf-8", errors="replace")
+        stderr_thread.join(timeout=5.0)
+        discard_process(proc_holder, proc)
+        err = decode_tail_bytes(stderr_tail)
         if not killed_by_us and not _ffmpeg_exit_ok(proc.returncode, err):
             if stderr_filter:
                 stderr_filter(err)

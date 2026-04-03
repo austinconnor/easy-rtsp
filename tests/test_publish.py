@@ -133,6 +133,7 @@ def test_build_nvenc_encoder_flag() -> None:
 
 
 def test_run_publish_loop_tcp_listen() -> None:
+    holder: list[object] = []
     with (
         patch("easy_rtsp.publish.subprocess.Popen") as p,
         patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
@@ -150,14 +151,17 @@ def test_run_publish_loop_tcp_listen() -> None:
             height=48,
             fps=1.0,
             config=StreamConfig(),
+            proc_holder=holder,
             tcp_listen=("127.0.0.1", 9),
         )
         args = p.call_args[0][0]
         assert "mpegts" in args
         assert any("tcp://" in a and "listen=1" in a for a in args)
+    assert holder == []
 
 
 def test_run_publish_loop_rtsp_push() -> None:
+    holder: list[object] = []
     with (
         patch("easy_rtsp.publish.subprocess.Popen") as p,
         patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
@@ -175,8 +179,10 @@ def test_run_publish_loop_rtsp_push() -> None:
             height=48,
             fps=1.0,
             config=StreamConfig(),
+            proc_holder=holder,
             rtsp_push_url="rtsp://127.0.0.1:9/x",
         )
         args = p.call_args[0][0]
         assert "rtsp" in args
         assert args[-1] == "rtsp://127.0.0.1:9/x"
+    assert holder == []

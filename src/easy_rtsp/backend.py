@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from easy_rtsp.exceptions import DependencyError, PublishError
 from easy_rtsp.ffmpeg_util import resolve_mediamtx
+from easy_rtsp.process_io import decode_tail_bytes, start_tail_reader
 
 
 def discover_webrtc_additional_hosts() -> list[str]:
@@ -108,9 +111,17 @@ paths:
 class MediaMTXProcess:
     """Started ``mediamtx`` subprocess with a generated config file."""
 
-    def __init__(self, process: subprocess.Popen[bytes], config_path: Path) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        config_path: Path,
+        stderr_tail: bytearray,
+        stderr_thread: threading.Thread,
+    ) -> None:
         self._process = process
         self._config_path = config_path
+        self._stderr_tail = stderr_tail
+        self._stderr_thread = stderr_thread
 
     @property
     def pid(self) -> int | None:
@@ -123,6 +134,11 @@ class MediaMTXProcess:
                 self._process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 self._process.kill()
+                try:
+                    self._process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    pass
+        self._stderr_thread.join(timeout=5.0)
         try:
             if self._config_path.exists():
                 self._config_path.unlink()
@@ -146,8 +162,16 @@ class MediaMTXProcess:
             )
         except FileNotFoundError as e:
             raise DependencyError("mediamtx could not be executed.") from e
+        assert proc.stderr is not None
+        stderr_tail, stderr_thread = start_tail_reader(
+            proc.stderr,
+            name="easy-rtsp-mediamtx-stderr",
+        )
         time.sleep(0.15)
         if proc.poll() is not None:
-            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
+            stderr_thread.join(timeout=5.0)
+            err = decode_tail_bytes(stderr_tail)
+            with suppress(OSError):
+                config_path.unlink()
             raise PublishError(f"mediamtx exited immediately (code {proc.returncode}): {err[-2000:]}")
-        return cls(proc, config_path)
+        return cls(proc, config_path, stderr_tail, stderr_thread)

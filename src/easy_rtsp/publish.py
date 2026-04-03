@@ -14,6 +14,7 @@ from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import PublishError
 from easy_rtsp.ffmpeg_util import resolve_ffmpeg
 from easy_rtsp.log import get_logger
+from easy_rtsp.process_io import discard_process
 
 _plog = get_logger("publish")
 
@@ -212,7 +213,9 @@ def run_publish_loop(
             [ffmpeg, *cmd],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            # Never PIPE stderr without draining during the loop — FFmpeg can fill the buffer and
+            # block forever, leaking RAM and leaving a zombie child after Ctrl+C.
+            stderr=subprocess.DEVNULL,
         )
         if proc_holder is not None:
             proc_holder.append(proc)
@@ -230,14 +233,9 @@ def run_publish_loop(
             proc.stdin.write(frame.tobytes())
             proc.stdin.flush()
         proc.stdin.close()
-        stderr = b""
-        if proc.stderr:
-            stderr = proc.stderr.read() or b""
         code = proc.wait(timeout=120)
         if code != 0:
-            raise PublishError(
-                f"ffmpeg publisher exited with {code}: {stderr.decode('utf-8', errors='replace')[-4000:]}"
-            )
+            raise PublishError(f"ffmpeg publisher exited with code {code}")
     except BrokenPipeError:
         pass
     except OSError as e:
@@ -253,12 +251,23 @@ def run_publish_loop(
     except PublishError:
         raise
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        if proc is not None:
             try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                if proc.stdin:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            discard_process(proc_holder, proc)
 
 
 def start_publish_thread(

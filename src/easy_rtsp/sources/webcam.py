@@ -25,7 +25,7 @@ def probe_webcam_dimensions(index: int, *, timeout_sec: float = _DEFAULT_PROBE_T
     except ImportError as e:
         raise DependencyError(
             "OpenCV (cv2) is required for webcam capture but could not be imported. "
-            "Reinstall easy-rtsp or install opencv-python-headless."
+            'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
         ) from e
 
     result: list[tuple[int, int]] = []
@@ -78,7 +78,7 @@ class WebcamSource:
         except ImportError as e:
             raise DependencyError(
                 "OpenCV (cv2) is required for webcam capture but could not be imported. "
-                "Reinstall easy-rtsp or install opencv-python-headless."
+                'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
             ) from e
 
         cap = cv2.VideoCapture(self._index)

@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import json
-from io import BytesIO
+import sys
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from easy_rtsp.install_backends import print_ffmpeg_install_hints, run_install_backends
 
 
-def test_print_ffmpeg_hints_does_not_crash(capsys) -> None:
-    print_ffmpeg_install_hints()
-    out = capsys.readouterr().out
-    assert "FFmpeg" in out
+def test_print_ffmpeg_hints_does_not_crash() -> None:
+    buf = StringIO()
+    with patch.object(sys, "stdout", buf):
+        print_ffmpeg_install_hints()
+    assert "FFmpeg" in buf.getvalue()
 
 
-def test_run_install_backends_skip_mediamtx(capsys) -> None:
-    out = run_install_backends(mediamtx=False, dry_run=False)
+def test_run_install_backends_skip_mediamtx() -> None:
+    buf = StringIO()
+    with patch.object(sys, "stdout", buf):
+        out = run_install_backends(mediamtx=False, dry_run=False)
     assert out["mediamtx"] is None
-    assert "FFmpeg" in capsys.readouterr().out
+    assert "FFmpeg" in buf.getvalue()
 
 
 def test_run_install_backends_dry_run_mediamtx(tmp_path: Path) -> None:
@@ -50,8 +54,8 @@ def test_install_mediamtx_download_mocked(tmp_path: Path) -> None:
             return _FakeResp(fake_tar)
         raise AssertionError(url)
 
-    with patch("easy_rtsp.install_backends.platform.system", return_value="Linux"), patch(
-        "easy_rtsp.install_backends.platform.machine", return_value="x86_64"
+    with patch("platform.system", return_value="Linux"), patch(
+        "platform.machine", return_value="x86_64"
     ), patch("easy_rtsp.install_backends.urllib.request.urlopen", side_effect=fake_urlopen):
         dest = install_mediamtx(prefix=tmp_path, dry_run=False)
 
