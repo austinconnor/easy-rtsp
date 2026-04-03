@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from easy_rtsp.config import StreamConfig
-from easy_rtsp.publish import build_raw_publish_ffmpeg_cmd, run_publish_loop
+from easy_rtsp.publish import (
+    build_raw_publish_ffmpeg_cmd,
+    build_rtsp_passthrough_ffmpeg_cmd,
+    run_publish_loop,
+    run_rtsp_passthrough_loop,
+)
 
 
 def test_build_rtsp_push_cmd() -> None:
@@ -132,6 +137,28 @@ def test_build_nvenc_encoder_flag() -> None:
     assert "-bf" not in cmd
 
 
+def test_build_rtsp_passthrough_cmd() -> None:
+    cmd = build_rtsp_passthrough_ffmpeg_cmd(
+        source_url="rtsp://camera/live",
+        config=StreamConfig(audio_mode="passthrough"),
+        rtsp_push_url="rtsp://127.0.0.1:8554/live",
+    )
+    assert cmd[cmd.index("-i") + 1] == "rtsp://camera/live"
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "pipe:0" not in cmd
+
+
+def test_build_rtsp_passthrough_tcp_listen_cmd() -> None:
+    cmd = build_rtsp_passthrough_ffmpeg_cmd(
+        source_url="rtsp://camera/live",
+        config=StreamConfig(audio_mode="passthrough"),
+        tcp_listen=("127.0.0.1", 8554),
+    )
+    assert "mpegts" in cmd
+    assert any("tcp://" in x and "listen=1" in x for x in cmd)
+
+
 def test_run_publish_loop_tcp_listen() -> None:
     holder: list[object] = []
     with (
@@ -184,5 +211,30 @@ def test_run_publish_loop_rtsp_push() -> None:
         )
         args = p.call_args[0][0]
         assert "rtsp" in args
+        assert args[-1] == "rtsp://127.0.0.1:9/x"
+    assert holder == []
+
+
+def test_run_rtsp_passthrough_loop_rtsp_push() -> None:
+    holder: list[object] = []
+    stop_event = MagicMock()
+    stop_event.is_set.return_value = False
+    with (
+        patch("easy_rtsp.publish.subprocess.Popen") as p,
+        patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
+    ):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+        p.return_value = mock_proc
+
+        run_rtsp_passthrough_loop(
+            "rtsp://camera/live",
+            config=StreamConfig(audio_mode="passthrough", reconnect=False),
+            proc_holder=holder,
+            stop_event=stop_event,
+            rtsp_push_url="rtsp://127.0.0.1:9/x",
+        )
+        args = p.call_args[0][0]
         assert args[-1] == "rtsp://127.0.0.1:9/x"
     assert holder == []

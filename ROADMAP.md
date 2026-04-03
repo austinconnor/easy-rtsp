@@ -2,7 +2,7 @@
 
 ## v0.1.2
 
-Focus: observability and capture ergonomics.
+Focus: observability, capture ergonomics, and scoped RTSP relay improvements.
 
 - Snapshot API
   - Add access to the latest processed frame.
@@ -11,7 +11,18 @@ Focus: observability and capture ergonomics.
 
 - Health and status API
   - Add a public status object that reports stream state, serve state, reconnect count, viewer URLs, and publish error state.
-  - Keep the first iteration intentionally small and stable so applications can build against it.
+  - Expand the first iteration with practical metrics like dropped frames, last-frame timing, publish uptime, child-process health, and reconnect reason.
+
+- Auth/config ergonomics
+  - Add helpers for building authenticated RTSP ingest and publish URLs safely.
+  - Preserve the existing URL-first API for advanced use cases.
+
+- Async-friendly wrappers
+  - Add thin async wrappers around blocking lifecycle calls so services can integrate without blocking an event loop.
+
+- Scoped audio support
+  - Add `audio_mode="passthrough"` for RTSP relay when no frame transform is applied.
+  - Keep unsupported combinations explicit rather than silently pretending audio works.
 
 - Reliability follow-through
   - Extend tests around lifecycle transitions and state reporting.
@@ -19,12 +30,10 @@ Focus: observability and capture ergonomics.
 
 ## v0.2.0
 
-Focus: audio-aware publishing.
+Focus: broader audio-aware publishing.
 
-- Smallest shippable audio feature
-  - RTSP relay audio passthrough only.
-  - Support `Stream.open(...).serve(...)` carrying source audio when the upstream RTSP stream already has audio.
-  - Keep `from_webcam`, `from_file`, and `from_frames` video-only until a later release.
+- Build on the scoped relay-audio path from v0.1.2.
+- Extend beyond relay passthrough only where the pipeline can support it honestly.
 
 - Proposed API shape
   - Add `audio_mode` to `StreamConfig` with values like `off` and `passthrough`.
@@ -50,8 +59,8 @@ Focus: audio-aware publishing.
   - Confusion if audio appears to be available for some source types but not others.
 
 - Recommended implementation sequence
-  - Phase 1: add config, CLI flags, and validation for relay-only audio mode.
-  - Phase 2: add a second FFmpeg publish path for RTSP relay with audio passthrough.
+  - Phase 1: broaden the relay audio path and codec handling.
+  - Phase 2: evaluate support for additional source types without hiding limitations.
   - Phase 3: add docs and matrix tests for audio-supported versus audio-unsupported source types.
 
 ## Later

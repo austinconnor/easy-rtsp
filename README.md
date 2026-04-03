@@ -54,6 +54,7 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 ### Ingest sources
 
 - **`Stream.open(url)`** — RTSP or RTSPS URL (FFmpeg decode; reconnect with backoff).
+- **`Stream.open_rtsp(host, path=..., username=..., password=...)`** — RTSP/RTSPS helper that builds a safe URL for you.
 - **`Stream.from_webcam(index)`** — Camera via OpenCV.
 - **`Stream.from_file(path)`** — File decode; **looping** uses FFmpeg `-stream_loop` (continuous by default).
 - **`Stream.from_frames(factory, fps, size)`** — Synthetic or custom frame iterators (BGR `uint8`).
@@ -66,6 +67,7 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 
 - **Shorthand path** — e.g. `"live"` → `rtsp://127.0.0.1:8554/live` (host/port from `StreamConfig.server_host` / `server_port`).
 - **Full URLs** — `rtsp://`, `rtsps://` (credentials preserved), **`srt://`** (MPEG-TS over SRT; no local MediaMTX RTSP process).
+- **`audio_mode="passthrough"`** — Relay source audio for RTSP ingest when using `Stream.open(...)` / `Stream.open_rtsp(...)` without frame transforms.
 - **Local MediaMTX** — If `mediamtx` is on `PATH` and the RTSP port on loopback is free, easy-rtsp writes a minimal config and starts MediaMTX.
 - **No MediaMTX** — FFmpeg listens for **one** MPEG-TS client over TCP (VLC: open `tcp://…`).
 - **Existing server** — If something already listens on the port, FFmpeg **pushes** RTSP in client mode.
@@ -103,8 +105,10 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 ### Control flow
 
 - **`serve()`** — Starts publish in a background thread (non-blocking).
+- **`serve_rtsp(host, path=..., username=..., password=...)`** — Convenience wrapper for building authenticated RTSP/RTSPS publish URLs.
 - **`wait()`** / **`wait(timeout=…)`** — Block until publish ends (polling-friendly for **Ctrl+C** on Windows).
 - **`stop()`** — Stops encode/decode FFmpeg children and MediaMTX if started.
+- **`wait_async()`** / **`stop_async()`** — Thin async wrappers for service environments like FastAPI or background workers.
 - **`latest_frame()`** — Read the latest processed frame for snapshots, previews, or monitoring.
 - **`save_snapshot(path)`** — Write the latest processed frame to an image file.
 - **`status()`** — Get an immutable health snapshot with state, reconnect count, URLs, and error state.
@@ -119,7 +123,7 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 - **`doctor`** — FFmpeg, ffprobe, MediaMTX, platform.
 - **`install-backends`** — FFmpeg hints; optional MediaMTX download (`--prefix`, `--dry-run`, `--skip-mediamtx`).
 
-Shared **`--serve`** flags: endpoint, transport (relay), reconnect options, **`--server-host`** / **`--server-port`**, **`--low-latency-input`**, **`--record`**, **`--hls-dir`**, **`--hls-segment-time`**, **`--video-encoder`**, **`--webrtc`** / **`--no-webrtc`**, **`--webrtc-port`**, **`-v`**.
+Shared **`--serve`** flags: endpoint, transport (relay), reconnect options, **`--server-host`** / **`--server-port`**, **`--low-latency-input`**, **`--record`**, **`--hls-dir`**, **`--hls-segment-time`**, **`--video-encoder`**, **`--audio-mode`**, **`--webrtc`** / **`--no-webrtc`**, **`--webrtc-port`**, **`-v`**.
 
 Logs go to **stderr**; **`Play:`** / **`WebRTC:`** URLs to **stdout**. **SIGINT** is wired so **Ctrl+C** calls **`stop()`** reliably on Windows.
 
@@ -134,11 +138,17 @@ from easy_rtsp import Stream
 for frame in Stream.open("rtsp://camera/live").frames():
     ...
 
+# Ingest RTSP from connection parts
+relay = Stream.open_rtsp("camera.local", "cam/main", username="user", password="secret")
+
 # Webcam → transform → publish
 Stream.from_webcam(0).map(process_frame).serve("live")
 
 # File with options (see StreamConfig)
 Stream.from_file("clip.mp4", file_loop=True).serve("live")
+
+# RTSP relay with audio passthrough
+relay.serve_rtsp("127.0.0.1", "live", audio_mode="passthrough")
 
 # Wait for shutdown
 stream = Stream.from_webcam(0).serve("live")

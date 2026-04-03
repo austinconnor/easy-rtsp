@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 Transport = Literal["tcp", "udp"]
 Backend = Literal["auto", "ffmpeg"]
+AudioMode = Literal["off", "passthrough"]
 
 
 @dataclass
@@ -28,6 +29,9 @@ class StreamConfig:
 
     bitrate: str | None = None
     """Optional encoder bitrate, e.g. ``\"4M\"``."""
+
+    audio_mode: AudioMode = "off"
+    """Audio publishing mode. ``off`` disables audio, ``passthrough`` relays source audio when supported."""
 
     reconnect: bool = True
     """Whether to retry RTSP ingest after disconnect."""

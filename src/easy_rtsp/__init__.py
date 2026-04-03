@@ -22,6 +22,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "StreamState": ("easy_rtsp.types", "StreamState"),
     "StreamStatus": ("easy_rtsp.types", "StreamStatus"),
     "PublishDestination": ("easy_rtsp.serve_url", "PublishDestination"),
+    "build_rtsp_url": ("easy_rtsp.serve_url", "build_rtsp_url"),
     "parse_publish_destination": ("easy_rtsp.serve_url", "parse_publish_destination"),
     "configure_logging": ("easy_rtsp.log", "configure_logging"),
     "get_logger": ("easy_rtsp.log", "get_logger"),
@@ -38,6 +39,7 @@ __all__ = [
     "ProcessingError",
     "PublishError",
     "PublishDestination",
+    "build_rtsp_url",
     "parse_publish_destination",
     "SourceError",
     "Stream",
@@ -69,6 +71,6 @@ def __dir__() -> list[str]:
 
 if TYPE_CHECKING:
     from easy_rtsp.log import configure_logging, get_logger, setup_cli_logging
-    from easy_rtsp.serve_url import PublishDestination, parse_publish_destination
+    from easy_rtsp.serve_url import PublishDestination, build_rtsp_url, parse_publish_destination
     from easy_rtsp.stream import Stream
     from easy_rtsp.types import StreamState, StreamStatus

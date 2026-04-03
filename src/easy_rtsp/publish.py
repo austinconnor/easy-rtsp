@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import numpy as np
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import PublishError
-from easy_rtsp.ffmpeg_util import resolve_ffmpeg
+from easy_rtsp.ffmpeg_util import ffmpeg_ingest_rtsp_args, resolve_ffmpeg
 from easy_rtsp.log import get_logger
 from easy_rtsp.process_io import discard_process
 
@@ -183,6 +184,58 @@ def build_raw_publish_ffmpeg_cmd(
     return base + mux + ["-f", "rtsp", "-rtsp_transport", "tcp", rtsp_push_url]
 
 
+def build_rtsp_passthrough_ffmpeg_cmd(
+    *,
+    source_url: str,
+    config: StreamConfig,
+    rtsp_push_url: str | None = None,
+    srt_push_url: str | None = None,
+    tcp_listen: tuple[str, int] | None = None,
+) -> list[str]:
+    """
+    FFmpeg argv after the binary for RTSP relay with video/audio passthrough.
+
+    Exactly one of *rtsp_push_url*, *srt_push_url*, or *tcp_listen* must be provided.
+    """
+    n_dest = sum(1 for x in (rtsp_push_url, srt_push_url, tcp_listen) if x is not None)
+    if n_dest != 1:
+        raise PublishError("internal: specify exactly one of rtsp_push_url, srt_push_url, tcp_listen")
+
+    input_args = config.extra_ffmpeg_input_args + ffmpeg_ingest_rtsp_args(
+        source_url,
+        config.transport,
+        config.latency_ms,
+    )
+    base = [
+        "-loglevel",
+        "warning",
+        *input_args,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+    ]
+    mux = ["-muxdelay", "0", "-muxpreload", "0"]
+
+    if tcp_listen is not None:
+        host, port = tcp_listen
+        dest = f"tcp://{host}:{port}?listen=1"
+        return base + mux + ["-f", "mpegts", dest]
+
+    if srt_push_url is not None:
+        return base + mux + ["-f", "mpegts", srt_push_url]
+
+    assert rtsp_push_url is not None
+    if config.record_path or config.hls_output_dir:
+        tee_arg = _build_tee_spec(rtsp_push_url, config)
+        return base + ["-f", "tee", tee_arg]
+    return base + mux + ["-f", "rtsp", "-rtsp_transport", "tcp", rtsp_push_url]
+
+
 def run_publish_loop(
     frame_iter: Iterator[np.ndarray],
     *,
@@ -268,6 +321,115 @@ def run_publish_loop(
                     except subprocess.TimeoutExpired:
                         pass
             discard_process(proc_holder, proc)
+
+
+def run_rtsp_passthrough_loop(
+    source_url: str,
+    *,
+    config: StreamConfig,
+    proc_holder: list[subprocess.Popen[bytes] | None] | None = None,
+    stop_event: threading.Event | None = None,
+    rtsp_push_url: str | None = None,
+    srt_push_url: str | None = None,
+    tcp_listen: tuple[str, int] | None = None,
+) -> None:
+    """Blocking: relay RTSP video and audio directly to RTSP, SRT, or TCP listen."""
+    resolve_ffmpeg()
+    ffmpeg = resolve_ffmpeg()
+    attempt = 0
+
+    while True:
+        proc: subprocess.Popen[bytes] | None = None
+        reconnect_reason: str | None = None
+        try:
+            cmd = build_rtsp_passthrough_ffmpeg_cmd(
+                source_url=source_url,
+                config=config,
+                rtsp_push_url=rtsp_push_url,
+                srt_push_url=srt_push_url,
+                tcp_listen=tcp_listen,
+            )
+            proc = subprocess.Popen(
+                [ffmpeg, *cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if proc_holder is not None:
+                proc_holder.append(proc)
+            code = proc.wait()
+            if stop_event is not None and stop_event.is_set():
+                return
+            if code == 0:
+                reconnect_reason = "stream_ended"
+            else:
+                reconnect_reason = "publish_exited"
+                if not config.reconnect:
+                    raise PublishError(f"ffmpeg passthrough publisher exited with code {code}")
+        finally:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                discard_process(proc_holder, proc)
+
+        if stop_event is not None and stop_event.is_set():
+            return
+        if not config.reconnect:
+            return
+        if config.max_reconnect_attempts is not None and attempt >= config.max_reconnect_attempts:
+            if reconnect_reason == "publish_exited":
+                raise PublishError("ffmpeg passthrough publisher exhausted reconnect attempts")
+            return
+
+        attempt += 1
+        if config.on_reconnecting is not None:
+            config.on_reconnecting(attempt)
+        interval = max(0.0, float(config.retry_interval_sec))
+        if interval:
+            time.sleep(interval)
+
+
+def start_rtsp_passthrough_thread(
+    source_url: str,
+    *,
+    config: StreamConfig,
+    proc_holder: list[subprocess.Popen[bytes] | None] | None,
+    stop_event: threading.Event | None,
+    on_done: Callable[[BaseException | None], None],
+    rtsp_push_url: str | None = None,
+    srt_push_url: str | None = None,
+    tcp_listen: tuple[str, int] | None = None,
+) -> threading.Thread:
+    """Run :func:`run_rtsp_passthrough_loop` in a daemon thread."""
+
+    def _run() -> None:
+        err: BaseException | None = None
+        try:
+            run_rtsp_passthrough_loop(
+                source_url,
+                config=config,
+                proc_holder=proc_holder,
+                stop_event=stop_event,
+                rtsp_push_url=rtsp_push_url,
+                srt_push_url=srt_push_url,
+                tcp_listen=tcp_listen,
+            )
+        except BaseException as e:
+            err = e
+        finally:
+            on_done(err)
+
+    t = threading.Thread(target=_run, name="easy-rtsp-publish-audio", daemon=True)
+    t.start()
+    return t
 
 
 def start_publish_thread(

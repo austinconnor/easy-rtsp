@@ -26,6 +26,7 @@ class RtspSource:
         self._url = url
         self._config = config or StreamConfig()
         self._reconnect_count = 0
+        self._last_reconnect_reason: str | None = None
 
     @property
     def config(self) -> StreamConfig:
@@ -35,6 +36,11 @@ class RtspSource:
     def reconnect_count(self) -> int:
         """How many reconnects have been scheduled after a disconnect or probe failure."""
         return self._reconnect_count
+
+    @property
+    def last_reconnect_reason(self) -> str | None:
+        """Reason recorded for the most recent reconnect attempt or terminal failure."""
+        return self._last_reconnect_reason
 
     def frames(self) -> Iterator[np.ndarray]:
         """Yield decoded frames; reconnects according to :class:`~easy_rtsp.config.StreamConfig`."""
@@ -46,7 +52,7 @@ class RtspSource:
             except Exception as e:
                 if not self._config.reconnect or self._reconnect_exhausted():
                     raise SourceError(f"RTSP probe failed for {self._url!r}: {e}") from e
-                self._notify_reconnect()
+                self._notify_reconnect("probe_failed")
                 continue
 
             w, h = probe.width, probe.height
@@ -73,7 +79,7 @@ class RtspSource:
                     raise SourceError(
                         f"RTSP decode failed for {self._url!r} (reconnect_count={self._reconnect_count}): {e}"
                     ) from e
-                self._notify_reconnect()
+                self._notify_reconnect("decode_failed")
                 continue
 
             # FFmpeg exited cleanly (e.g. stream ended).
@@ -85,7 +91,7 @@ class RtspSource:
                     self._config.max_reconnect_attempts,
                 )
                 break
-            self._notify_reconnect()
+            self._notify_reconnect("stream_ended")
 
     def _reconnect_exhausted(self) -> bool:
         m = self._config.max_reconnect_attempts
@@ -93,11 +99,13 @@ class RtspSource:
             return False
         return self._reconnect_count >= m
 
-    def _notify_reconnect(self) -> None:
+    def _notify_reconnect(self, reason: str) -> None:
         self._reconnect_count += 1
+        self._last_reconnect_reason = reason
         interval = max(0.0, float(self._config.retry_interval_sec))
         _logger.warning(
-            "RTSP disconnected or session ended; reconnecting in %.2fs (reconnect #%s)",
+            "RTSP disconnected or session ended (%s); reconnecting in %.2fs (reconnect #%s)",
+            reason,
             interval,
             self._reconnect_count,
         )

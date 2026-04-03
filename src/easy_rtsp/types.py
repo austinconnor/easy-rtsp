@@ -31,6 +31,12 @@ class StreamStatus:
     created_at: float
     last_state_change_at: float
     publish_thread_alive: bool
+    last_reconnect_reason: str | None
+    dropped_frame_count: int
+    last_frame_at: float | None
+    publish_started_at: float | None
+    publish_uptime_sec: float | None
+    alive_child_process_count: int
 
     @property
     def has_publish_error(self) -> bool:

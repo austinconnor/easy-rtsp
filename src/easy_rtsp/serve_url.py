@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import ConfigurationError
@@ -23,6 +23,37 @@ class PublishDestination:
 
     scheme: str
     """``rtsp``, ``rtsps``, or ``srt``."""
+
+
+def build_rtsp_url(
+    host: str,
+    path: str = "live",
+    *,
+    port: int = 8554,
+    username: str | None = None,
+    password: str | None = None,
+    secure: bool = False,
+) -> str:
+    """
+    Build an RTSP or RTSPS URL without requiring callers to hand-assemble userinfo.
+
+    Username and password are percent-encoded safely so special characters remain valid in the URL.
+    """
+    if not host:
+        raise ConfigurationError("RTSP host must be non-empty")
+    if not path:
+        path = "live"
+    scheme = "rtsps" if secure else "rtsp"
+    path_clean = path if path.startswith("/") else f"/{path.lstrip('/')}"
+    path_clean = quote(path_clean, safe="/")
+    userinfo = ""
+    if username is not None:
+        userinfo = quote(username, safe="")
+        if password is not None:
+            userinfo += f":{quote(password, safe='')}"
+        userinfo += "@"
+    netloc = f"{userinfo}{host}:{int(port)}"
+    return urlunparse((scheme, netloc, path_clean, "", "", ""))
 
 
 def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestination:

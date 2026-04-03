@@ -124,6 +124,8 @@ def _config_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         d["hls_segment_time"] = float(args.hls_segment_time)
     if getattr(args, "video_encoder", None):
         d["video_encoder"] = args.video_encoder
+    if getattr(args, "audio_mode", None) is not None:
+        d["audio_mode"] = args.audio_mode
     if getattr(args, "webrtc_enabled", None) is not None:
         d["webrtc_enabled"] = bool(args.webrtc_enabled)
     if getattr(args, "webrtc_port", None) is not None:
@@ -284,6 +286,12 @@ def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
         metavar="NAME",
         default=None,
         help="FFmpeg video encoder (e.g. h264_nvenc, h264_qsv); default is libx264 for H.264",
+    )
+    p.add_argument(
+        "--audio-mode",
+        choices=["off", "passthrough"],
+        default=StreamConfig.audio_mode,
+        help="Audio publishing mode (default: %(default)s; passthrough currently supports RTSP relay only)",
     )
     p.add_argument(
         "--webrtc",

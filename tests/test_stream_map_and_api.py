@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -127,6 +128,34 @@ def test_serve_twice_raises() -> None:
             s.serve("live")
 
 
+def test_open_rtsp_builds_credentials_safely() -> None:
+    with patch("easy_rtsp.stream.RtspSource") as mock_source:
+        Stream.open_rtsp(
+            "camera.example.com",
+            "feed 1",
+            username="user name",
+            password="p@ss:word",
+            port=8554,
+        )
+
+    assert mock_source.call_args[0][0] == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
+
+
+def test_serve_rtsp_builds_credentials_safely() -> None:
+    stream = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
+
+    with patch.object(stream, "serve", return_value=stream) as mock_serve:
+        stream.serve_rtsp(
+            "camera.example.com",
+            "feed 1",
+            username="user name",
+            password="p@ss:word",
+            port=8554,
+        )
+
+    assert mock_serve.call_args[0][0] == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
+
+
 def test_viewer_url_none_before_serve() -> None:
     def gen():
         yield np.zeros((10, 10, 3), dtype=np.uint8)
@@ -151,6 +180,28 @@ def test_stop_unblocks_waiters_even_without_publish_thread() -> None:
     s = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
     s.stop()
     assert s.wait(timeout=0.0)
+
+
+def test_wait_async_delegates_to_wait_without_blocking_loop() -> None:
+    s = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
+    wait_mock = MagicMock(return_value=True)
+
+    with patch.object(s, "wait", wait_mock):
+        result = asyncio.run(s.wait_async(timeout=1.25))
+
+    assert result is True
+    wait_mock.assert_called_once_with(1.25)
+
+
+def test_stop_async_delegates_to_stop_without_blocking_loop() -> None:
+    s = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
+    stop_mock = MagicMock(return_value=None)
+
+    with patch.object(s, "stop", stop_mock):
+        result = asyncio.run(s.stop_async())
+
+    assert result is None
+    stop_mock.assert_called_once_with()
 
 
 def test_status_reports_initial_state() -> None:
@@ -230,6 +281,35 @@ def test_status_reports_publish_error_flag() -> None:
     status = s.status()
     assert status.publish_error == "boom"
     assert status.has_publish_error is True
+
+
+def test_audio_passthrough_uses_direct_rtsp_relay_thread() -> None:
+    thread = MagicMock()
+
+    with (
+        patch("easy_rtsp.stream.start_rtsp_passthrough_thread", return_value=thread) as start_relay,
+        patch("easy_rtsp.stream.start_publish_thread") as start_publish,
+        patch("easy_rtsp.stream.resolve_mediamtx", return_value=None),
+        patch("easy_rtsp.stream.tcp_port_is_available", return_value=False),
+        patch("easy_rtsp.stream.probe_video"),
+    ):
+        stream = Stream.open("rtsp://camera/live", audio_mode="passthrough").serve("live")
+
+    assert stream.viewer_url == "rtsp://127.0.0.1:8554/live"
+    assert start_relay.called
+    start_publish.assert_not_called()
+
+
+def test_audio_passthrough_requires_rtsp_source() -> None:
+    stream = Stream.from_frames(iter(()), fps=30.0, size=(4, 4), audio_mode="passthrough")
+    with pytest.raises(ConfigurationError, match="supported only for Stream.open"):
+        stream.serve("live")
+
+
+def test_audio_passthrough_rejects_transforms() -> None:
+    stream = Stream.open("rtsp://camera/live", audio_mode="passthrough").map(lambda frame: frame)
+    with pytest.raises(ConfigurationError, match="not compatible with frame transforms"):
+        stream.serve("live")
 
 
 def test_save_snapshot_writes_image_file(tmp_path: Path) -> None:

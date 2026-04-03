@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import asyncio
 import os
 import tempfile
 import threading
@@ -18,8 +19,8 @@ from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError
 from easy_rtsp.ffmpeg_util import probe_video, resolve_mediamtx
 from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
-from easy_rtsp.publish import start_publish_thread
-from easy_rtsp.serve_url import is_loopback_host, parse_publish_destination
+from easy_rtsp.publish import start_publish_thread, start_rtsp_passthrough_thread
+from easy_rtsp.serve_url import build_rtsp_url, is_loopback_host, parse_publish_destination
 from easy_rtsp.sources.file import FileSource
 from easy_rtsp.sources.frames import FrameGeneratorSource
 from easy_rtsp.sources.rtsp import RtspSource
@@ -54,17 +55,22 @@ class Stream:
         self._state = StreamState.STOPPED
         self._created_at = time.monotonic()
         self._last_state_change_at = self._created_at
+        self._publish_started_at: float | None = None
+        self._publish_ended_at: float | None = None
         self._publish_thread: threading.Thread | None = None
         self._backend: MediaMTXProcess | None = None
         self._publish_error: BaseException | None = None
         self._wait_event = threading.Event()
+        self._stop_event = threading.Event()
         self._latest_frame_lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
+        self._last_frame_at: float | None = None
+        self._dropped_frame_count = 0
         self._serve_started = False
         self._viewer_url: str | None = None
         self._webrtc_play_url: str | None = None
 
-        if isinstance(self._source, RtspSource):
+        if _is_rtsp_source(self._source):
             user_hook = self._config.on_reconnecting
 
             def _reconnect_hook(attempt: int) -> None:
@@ -79,7 +85,7 @@ class Stream:
     @property
     def reconnect_count(self) -> int:
         """RTSP ingest reconnect counter (0 if the source is not RTSP)."""
-        if isinstance(self._source, RtspSource):
+        if _is_rtsp_source(self._source):
             return self._source.reconnect_count
         return 0
 
@@ -119,11 +125,29 @@ class Stream:
         """Return an immutable snapshot of the stream's current health and lifecycle state."""
         with self._latest_frame_lock:
             latest_frame_available = self._latest_frame is not None
+            last_frame_at = self._last_frame_at
+        last_reconnect_reason = self._source.last_reconnect_reason if _is_rtsp_source(self._source) else None
+        alive_child_process_count = sum(
+            1
+            for proc in self._config.ffmpeg_children
+            if proc is not None and proc.poll() is None
+        )
+        if self._publish_started_at is None:
+            publish_uptime_sec = None
+        else:
+            end_at = self._publish_ended_at or time.monotonic()
+            publish_uptime_sec = max(0.0, end_at - self._publish_started_at)
         return StreamStatus(
             state=self._state,
             reconnect_count=self.reconnect_count,
+            last_reconnect_reason=last_reconnect_reason,
             serve_started=self._serve_started,
             latest_frame_available=latest_frame_available,
+            dropped_frame_count=self._dropped_frame_count,
+            last_frame_at=last_frame_at,
+            publish_started_at=self._publish_started_at,
+            publish_uptime_sec=publish_uptime_sec,
+            alive_child_process_count=alive_child_process_count,
             viewer_url=self._viewer_url,
             webrtc_play_url=self._webrtc_play_url,
             publish_error=None if self._publish_error is None else str(self._publish_error),
@@ -139,6 +163,29 @@ class Stream:
         """Open an RTSP URL (``rtsp://`` or ``rtsps://``)."""
         cfg = _stream_config_from_kwargs(**kwargs)
         return cls(RtspSource(url, cfg), config=cfg)
+
+    @classmethod
+    def open_rtsp(
+        cls,
+        host: str,
+        path: str = "live",
+        *,
+        port: int = 554,
+        username: str | None = None,
+        password: str | None = None,
+        secure: bool = False,
+        **kwargs: Any,
+    ) -> Stream:
+        """Open an RTSP or RTSPS URL from parts without manual URL assembly."""
+        url = build_rtsp_url(
+            host,
+            path,
+            port=port,
+            username=username,
+            password=password,
+            secure=secure,
+        )
+        return cls.open(url, **kwargs)
 
     @classmethod
     def from_webcam(cls, index: int = 0, **kwargs: Any) -> Stream:
@@ -235,9 +282,11 @@ class Stream:
                 except Exception as e:
                     raise ProcessingError("transform callback failed") from e
                 if out is None:
+                    self._dropped_frame_count += 1
                     continue
             with self._latest_frame_lock:
                 self._latest_frame = out.copy()
+                self._last_frame_at = time.monotonic()
             yield out
 
     def serve(self, endpoint: str = "live", **kwargs: Any) -> Stream:
@@ -267,9 +316,20 @@ class Stream:
         if self._serve_started:
             raise ConfigurationError("serve() was already started on this Stream")
 
+        use_audio_passthrough = self._config.audio_mode == "passthrough"
         self._webrtc_play_url = None
+        if use_audio_passthrough:
+            self._validate_audio_passthrough()
+        self._publish_started_at = time.monotonic()
+        self._publish_ended_at = None
+        self._stop_event.clear()
         dest = parse_publish_destination(endpoint, self._config)
-        w, h, fps = self._infer_publish_params()
+
+        if use_audio_passthrough:
+            w = h = 0
+            fps = 0.0
+        else:
+            w, h, fps = self._infer_publish_params()
 
         if self._config.hls_output_dir:
             Path(self._config.hls_output_dir).mkdir(parents=True, exist_ok=True)
@@ -329,6 +389,7 @@ class Stream:
             return iter(self.frames())
 
         def on_done(err: BaseException | None) -> None:
+            self._publish_ended_at = time.monotonic()
             self._publish_error = err
             if err is not None:
                 self._set_state(StreamState.ERROR)
@@ -340,18 +401,31 @@ class Stream:
             if backend is not None:
                 backend.stop()
 
-        self._publish_thread = start_publish_thread(
-            factory,
-            width=w,
-            height=h,
-            fps=fps,
-            config=self._config,
-            proc_holder=self._config.ffmpeg_children,
-            on_done=on_done,
-            rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
-            srt_push_url=srt_push_url,
-            tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
-        )
+        if use_audio_passthrough:
+            assert isinstance(self._source, RtspSource)
+            self._publish_thread = start_rtsp_passthrough_thread(
+                self._source._url,
+                config=self._config,
+                proc_holder=self._config.ffmpeg_children,
+                stop_event=self._stop_event,
+                on_done=on_done,
+                rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
+                srt_push_url=srt_push_url,
+                tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
+            )
+        else:
+            self._publish_thread = start_publish_thread(
+                factory,
+                width=w,
+                height=h,
+                fps=fps,
+                config=self._config,
+                proc_holder=self._config.ffmpeg_children,
+                on_done=on_done,
+                rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
+                srt_push_url=srt_push_url,
+                tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
+            )
         if tcp_mpegts_listen:
             self._viewer_url = f"tcp://{dest.host}:{dest.port}"
         else:
@@ -366,6 +440,33 @@ class Stream:
                 f"http://{dest.host}:{self._config.webrtc_http_port}/{dest.path_name}"
             )
         return self
+
+    def serve_rtsp(
+        self,
+        host: str,
+        path: str = "live",
+        *,
+        port: int = 8554,
+        username: str | None = None,
+        password: str | None = None,
+        secure: bool = False,
+        **kwargs: Any,
+    ) -> Stream:
+        """
+        Publish to an RTSP or RTSPS destination built from discrete connection parts.
+
+        This is a convenience wrapper around :meth:`serve` that avoids manual URL assembly,
+        especially when credentials need percent-encoding.
+        """
+        url = build_rtsp_url(
+            host,
+            path,
+            port=port,
+            username=username,
+            password=password,
+            secure=secure,
+        )
+        return self.serve(url, **kwargs)
 
     def wait(self, timeout: float | None = None) -> bool:
         """
@@ -387,8 +488,13 @@ class Stream:
             if self._wait_event.wait(timeout=min(_WAIT_POLL_SEC, remaining)):
                 return True
 
+    async def wait_async(self, timeout: float | None = None) -> bool:
+        """Async wrapper for :meth:`wait` that avoids blocking the event loop."""
+        return await asyncio.to_thread(self.wait, timeout)
+
     def stop(self) -> None:
         """Stop publishing and any MediaMTX instance started by this stream."""
+        self._stop_event.set()
         children = list(self._config.ffmpeg_children)
         for proc in children:
             if proc is not None and proc.poll() is None:
@@ -404,12 +510,18 @@ class Stream:
         if self._backend is not None:
             self._backend.stop()
             self._backend = None
+        if self._publish_ended_at is None:
+            self._publish_ended_at = time.monotonic()
         self._set_state(StreamState.STOPPING)
         if self._publish_thread and self._publish_thread.is_alive():
             self._publish_thread.join(timeout=20.0)
         self._set_state(StreamState.STOPPED)
         self._wait_event.set()
         self._config.ffmpeg_children.clear()
+
+    async def stop_async(self) -> None:
+        """Async wrapper for :meth:`stop` that avoids blocking the event loop."""
+        await asyncio.to_thread(self.stop)
 
     def __enter__(self) -> Stream:
         return self
@@ -443,6 +555,16 @@ class Stream:
         self._state = state
         self._last_state_change_at = time.monotonic()
 
+    def _validate_audio_passthrough(self) -> None:
+        if not isinstance(self._source, RtspSource):
+            raise ConfigurationError(
+                "audio_mode='passthrough' is currently supported only for Stream.open()/open_rtsp() RTSP sources"
+            )
+        if self._transform is not None:
+            raise ConfigurationError(
+                "audio_mode='passthrough' is not compatible with frame transforms in this release"
+            )
+
 
 def _stream_config_from_kwargs(**kwargs: Any) -> StreamConfig:
     fields = {f.name for f in dataclasses.fields(StreamConfig)}
@@ -450,3 +572,7 @@ def _stream_config_from_kwargs(**kwargs: Any) -> StreamConfig:
     if unknown:
         raise ConfigurationError(f"Unknown stream options: {sorted(unknown)}")
     return StreamConfig(**kwargs)
+
+
+def _is_rtsp_source(source: Any) -> bool:
+    return source.__class__.__name__ == "RtspSource"
