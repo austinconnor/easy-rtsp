@@ -105,6 +105,9 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 - **`serve()`** — Starts publish in a background thread (non-blocking).
 - **`wait()`** / **`wait(timeout=…)`** — Block until publish ends (polling-friendly for **Ctrl+C** on Windows).
 - **`stop()`** — Stops encode/decode FFmpeg children and MediaMTX if started.
+- **`latest_frame()`** — Read the latest processed frame for snapshots, previews, or monitoring.
+- **`save_snapshot(path)`** — Write the latest processed frame to an image file.
+- **`status()`** — Get an immutable health snapshot with state, reconnect count, URLs, and error state.
 - **Context manager** — `with stream:` calls **`stop()`** on exit.
 - **`Stream.state`**, **`reconnect_count`** (RTSP), **`viewer_url`**, **`webrtc_play_url`**.
 
@@ -140,6 +143,7 @@ Stream.from_file("clip.mp4", file_loop=True).serve("live")
 # Wait for shutdown
 stream = Stream.from_webcam(0).serve("live")
 print(stream.viewer_url)
+print(stream.status())
 stream.wait()
 ```
 
