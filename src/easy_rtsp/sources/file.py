@@ -9,7 +9,7 @@ import numpy as np
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import SourceError
-from easy_rtsp.ffmpeg_util import probe_video, resolve_ffmpeg
+from easy_rtsp.ffmpeg_util import probe_video
 from easy_rtsp.sources.base import ensure_bgr_uint8
 from easy_rtsp.sources.decode import iter_raw_bgr_frames
 
@@ -28,7 +28,6 @@ class FileSource:
         return self._config
 
     def frames(self) -> Iterator[np.ndarray]:
-        resolve_ffmpeg()
         path_str = str(self._path.resolve())
         probe = probe_video(path_str)
         w, h = probe.width, probe.height
