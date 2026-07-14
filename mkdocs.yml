@@ -1,0 +1,96 @@
+site_name: easy-rtsp
+site_description: Ingest, transform, and publish RTSP streams with a small Python API.
+site_url: https://austinconnor.github.io/easy-rtsp/
+repo_url: https://github.com/austinconnor/easy-rtsp
+repo_name: austinconnor/easy-rtsp
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 easy-rtsp contributors
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  font: false
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.path
+    - navigation.footer
+    - content.action.edit
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/austinconnor/easy-rtsp
+      name: easy-rtsp on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/easy-rtsp/
+      name: easy-rtsp on PyPI
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Installation: getting-started.md
+      - Local publishing: guides/local-publishing.md
+      - LAN streaming: guides/lan-streaming.md
+  - Guides:
+      - Relay and transform: guides/relay-transform.md
+      - Recording and HLS: guides/recording-hls.md
+  - Reference:
+      - Python API: reference/python-api.md
+      - Configuration: reference/configuration.md
+      - CLI: reference/cli.md
+  - Operations:
+      - Dependencies: operations/dependencies.md
+      - Troubleshooting: operations/troubleshooting.md
+  - Contributing: contributing.md

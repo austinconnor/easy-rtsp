@@ -220,7 +220,7 @@ class Stream:
 
     @classmethod
     def from_webcam(cls, index: int = 0, **kwargs: Any) -> Stream:
-        """Open a webcam by index (uses OpenCV, bundled as a dependency)."""
+        """Open a webcam by index (requires the optional OpenCV ``webcam`` extra)."""
         cfg = _stream_config_from_kwargs(**kwargs)
         return cls(WebcamSource(index, cfg), config=cfg)
 

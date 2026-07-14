@@ -59,3 +59,8 @@ target-version = "py310"
 [tool.setuptools_scm]
 fallback_version = "0.0.0"
 local_scheme = "no-local-version"
+
+[dependency-groups]
+docs = [
+    "mkdocs-material==9.7.6",
+]
