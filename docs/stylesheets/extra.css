@@ -5,6 +5,7 @@
   --ertsp-blue-dark: #075985;
   --ertsp-border: #d9e0e8;
   --ertsp-surface: #f5f7f9;
+  --md-typeset-a-color: #075985;
   --md-primary-fg-color: #0b2538;
   --md-primary-fg-color--light: #0875a5;
   --md-primary-fg-color--dark: #071a28;
@@ -19,6 +20,7 @@
   --ertsp-blue-dark: #7dd3ed;
   --ertsp-border: #303b4a;
   --ertsp-surface: #151c26;
+  --md-typeset-a-color: #67c7e5;
   --md-primary-fg-color: #0b1722;
   --md-primary-fg-color--light: #153247;
   --md-primary-fg-color--dark: #080f16;
@@ -28,6 +30,47 @@
 body,
 input {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+html {
+  min-height: 100%;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  scrollbar-color: #708197 transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+}
+
+body {
+  min-height: 100%;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: #708197;
+  background-clip: padding-box;
+}
+
+.md-typeset a:not(.md-button, .headerlink) {
+  color: var(--md-typeset-a-color);
+}
+
+.md-typeset a:not(.md-button, .headerlink):hover,
+.md-typeset a:not(.md-button, .headerlink):focus,
+.md-nav__link:hover,
+.md-nav__link:focus,
+.md-nav__link--active {
+  color: var(--md-accent-fg-color);
 }
 
 .md-header,
