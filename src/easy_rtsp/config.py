@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any, Literal
+
+from easy_rtsp.exceptions import ConfigurationError
 
 Transport = Literal["tcp", "udp"]
 Backend = Literal["auto", "ffmpeg"]
@@ -43,13 +46,16 @@ class StreamConfig:
     """Maximum RTSP ingest reconnect attempts (``None`` = unlimited)."""
 
     queue_size: int = 8
-    """Bounded queue depth between decode and publish when applicable."""
+    """Reserved queue depth for buffered pipelines; the current raw pipe path writes directly."""
 
     server_host: str = "127.0.0.1"
     """Default host for shorthand ``serve(\"path\")`` URLs."""
 
     server_port: int = 8554
     """Default RTSP port for shorthand ``serve(\"path\")`` URLs."""
+
+    lan_access: bool = False
+    """Expose a locally started MediaMTX server to other devices on the same network."""
 
     backend: Backend = "auto"
     """Media backend selection (v1 focuses on FFmpeg orchestration)."""
@@ -92,3 +98,67 @@ class StreamConfig:
 
     ffmpeg_children: list[Any] = field(default_factory=list, repr=False)
     """Internal: FFmpeg subprocesses (decode + encode) to terminate on :meth:`~easy_rtsp.stream.Stream.stop`."""
+
+    def __post_init__(self) -> None:
+        """Reject invalid values before they become obscure FFmpeg or socket errors."""
+        if self.transport not in ("tcp", "udp"):
+            raise ConfigurationError("transport must be 'tcp' or 'udp'")
+        if self.backend not in ("auto", "ffmpeg"):
+            raise ConfigurationError("backend must be 'auto' or 'ffmpeg'")
+        if self.audio_mode not in ("off", "passthrough"):
+            raise ConfigurationError("audio_mode must be 'off' or 'passthrough'")
+        if self.preset not in ("default", "low_latency", "quality"):
+            raise ConfigurationError("preset must be 'default', 'low_latency', or 'quality'")
+        if not isinstance(self.codec, str) or not self.codec.strip():
+            raise ConfigurationError("codec must be non-empty")
+        if self.video_encoder is not None and (
+            not isinstance(self.video_encoder, str) or not self.video_encoder.strip()
+        ):
+            raise ConfigurationError("video_encoder must be non-empty when provided")
+        if self.bitrate is not None and (
+            not isinstance(self.bitrate, str) or not self.bitrate.strip()
+        ):
+            raise ConfigurationError("bitrate must be non-empty when provided")
+        if self.latency_ms is not None and (
+            not isinstance(self.latency_ms, int)
+            or isinstance(self.latency_ms, bool)
+            or self.latency_ms < 0
+        ):
+            raise ConfigurationError("latency_ms must be zero or positive")
+        if not _is_nonnegative_number(self.retry_interval_sec):
+            raise ConfigurationError("retry_interval_sec must be zero or positive")
+        if self.max_reconnect_attempts is not None and (
+            not isinstance(self.max_reconnect_attempts, int)
+            or isinstance(self.max_reconnect_attempts, bool)
+            or self.max_reconnect_attempts < 0
+        ):
+            raise ConfigurationError("max_reconnect_attempts must be zero or positive")
+        if (
+            not isinstance(self.queue_size, int)
+            or isinstance(self.queue_size, bool)
+            or self.queue_size <= 0
+        ):
+            raise ConfigurationError("queue_size must be positive")
+        if not isinstance(self.server_host, str) or not self.server_host.strip():
+            raise ConfigurationError("server_host must be non-empty")
+        if not isinstance(self.lan_access, bool):
+            raise ConfigurationError("lan_access must be a boolean")
+        _validate_port("server_port", self.server_port)
+        _validate_port("webrtc_http_port", self.webrtc_http_port)
+        if self.fps is not None and not _is_positive_number(self.fps):
+            raise ConfigurationError("fps must be positive")
+        if not _is_positive_number(self.hls_segment_time):
+            raise ConfigurationError("hls_segment_time must be positive")
+
+
+def _validate_port(name: str, value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
+        raise ConfigurationError(f"{name} must be an integer between 1 and 65535")
+
+
+def _is_nonnegative_number(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and value > 0

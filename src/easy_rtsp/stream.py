@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
-import dataclasses
 import asyncio
+import dataclasses
 import os
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from easy_rtsp.backend import MediaMTXProcess, tcp_port_is_available, write_minimal_mediamtx_config
+from easy_rtsp.backend import (
+    MediaMTXProcess,
+    discover_lan_hosts,
+    tcp_port_is_available,
+    wait_for_tcp_listener,
+    write_minimal_mediamtx_config,
+)
 from easy_rtsp.config import StreamConfig
-from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError
-from easy_rtsp.ffmpeg_util import probe_video, resolve_mediamtx
+from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError, PublishError
+from easy_rtsp.ffmpeg_util import ffmpeg_rtsp_input_options, probe_video, resolve_mediamtx
 from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
 from easy_rtsp.publish import start_publish_thread, start_rtsp_passthrough_thread
-from easy_rtsp.serve_url import build_rtsp_url, is_loopback_host, parse_publish_destination
+from easy_rtsp.serve_url import (
+    build_rtsp_url,
+    format_url_host,
+    is_loopback_host,
+    parse_publish_destination,
+)
+from easy_rtsp.sources.base import ensure_bgr_uint8
 from easy_rtsp.sources.file import FileSource
 from easy_rtsp.sources.frames import FrameGeneratorSource
 from easy_rtsp.sources.rtsp import RtspSource
@@ -69,6 +82,8 @@ class Stream:
         self._serve_started = False
         self._viewer_url: str | None = None
         self._webrtc_play_url: str | None = None
+        self._lan_viewer_urls: tuple[str, ...] = ()
+        self._lan_webrtc_play_urls: tuple[str, ...] = ()
 
         if _is_rtsp_source(self._source):
             user_hook = self._config.on_reconnecting
@@ -121,6 +136,16 @@ class Stream:
         """
         return self._webrtc_play_url
 
+    @property
+    def lan_viewer_urls(self) -> tuple[str, ...]:
+        """Ready-to-use RTSP URLs for other devices when ``lan_access`` is enabled."""
+        return self._lan_viewer_urls
+
+    @property
+    def lan_webrtc_play_urls(self) -> tuple[str, ...]:
+        """Ready-to-use browser playback URLs for other devices on the LAN."""
+        return self._lan_webrtc_play_urls
+
     def status(self) -> StreamStatus:
         """Return an immutable snapshot of the stream's current health and lifecycle state."""
         with self._latest_frame_lock:
@@ -137,6 +162,10 @@ class Stream:
         else:
             end_at = self._publish_ended_at or time.monotonic()
             publish_uptime_sec = max(0.0, end_at - self._publish_started_at)
+        if self._publish_error is None:
+            publish_error = None
+        else:
+            publish_error = str(self._publish_error) or type(self._publish_error).__name__
         return StreamStatus(
             state=self._state,
             reconnect_count=self.reconnect_count,
@@ -150,7 +179,9 @@ class Stream:
             alive_child_process_count=alive_child_process_count,
             viewer_url=self._viewer_url,
             webrtc_play_url=self._webrtc_play_url,
-            publish_error=None if self._publish_error is None else str(self._publish_error),
+            lan_viewer_urls=self._lan_viewer_urls,
+            lan_webrtc_play_urls=self._lan_webrtc_play_urls,
+            publish_error=publish_error,
             created_at=self._created_at,
             last_state_change_at=self._last_state_change_at,
             publish_thread_alive=bool(
@@ -262,7 +293,7 @@ class Stream:
                 'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
             ) from e
 
-        dest = Path(path).expanduser()
+        dest = Path(path).expanduser().resolve()
         dest.parent.mkdir(parents=True, exist_ok=True)
         ok = cv2.imwrite(str(dest), frame)
         if not ok:
@@ -271,23 +302,31 @@ class Stream:
 
     def frames(self) -> Iterator[np.ndarray]:
         """Iterate decoded or generated frames (BGR ``uint8``)."""
-        for frame in self._source.frames():
-            if self._state in (StreamState.STOPPED, StreamState.RECONNECTING):
-                self._set_state(StreamState.RUNNING)
-            if self._transform is None:
-                out = frame
-            else:
+        try:
+            for frame in self._source.frames():
+                if self._state in (StreamState.STOPPED, StreamState.RECONNECTING):
+                    self._set_state(StreamState.RUNNING)
+                if self._transform is None:
+                    out = frame
+                else:
+                    try:
+                        out = self._transform(frame)
+                    except Exception as e:
+                        raise ProcessingError("transform callback failed") from e
+                    if out is None:
+                        self._dropped_frame_count += 1
+                        continue
                 try:
-                    out = self._transform(frame)
-                except Exception as e:
-                    raise ProcessingError("transform callback failed") from e
-                if out is None:
-                    self._dropped_frame_count += 1
-                    continue
-            with self._latest_frame_lock:
-                self._latest_frame = out.copy()
-                self._last_frame_at = time.monotonic()
-            yield out
+                    out = ensure_bgr_uint8(out, context="Stream frame")
+                except (AttributeError, ValueError) as e:
+                    raise ProcessingError(f"invalid frame returned by source or transform: {e}") from e
+                with self._latest_frame_lock:
+                    self._latest_frame = out.copy()
+                    self._last_frame_at = time.monotonic()
+                yield out
+        finally:
+            if not self._serve_started and self._state is not StreamState.ERROR:
+                self._set_state(StreamState.STOPPED)
 
     def serve(self, endpoint: str = "live", **kwargs: Any) -> Stream:
         """
@@ -312,29 +351,45 @@ class Stream:
         MediaMTX's WebRTC server; use :attr:`webrtc_play_url` for browser/mobile playback (no audio).
         """
         if kwargs:
-            self._config = dataclasses.replace(self._config, **_stream_config_from_kwargs(**kwargs))
+            old_config = self._config
+            self._config = dataclasses.replace(
+                old_config,
+                **_stream_options_from_kwargs(**kwargs),
+            )
+            # Built-in sources read ingest/file behavior from their own config reference.
+            # Keep it aligned when serve-time overrides create a replacement dataclass.
+            if getattr(self._source, "config", None) is old_config and hasattr(
+                self._source, "_config"
+            ):
+                self._source._config = self._config
         if self._serve_started:
             raise ConfigurationError("serve() was already started on this Stream")
 
         use_audio_passthrough = self._config.audio_mode == "passthrough"
         self._webrtc_play_url = None
+        self._lan_viewer_urls = ()
+        self._lan_webrtc_play_urls = ()
         if use_audio_passthrough:
             self._validate_audio_passthrough()
-        self._publish_started_at = time.monotonic()
-        self._publish_ended_at = None
         self._stop_event.clear()
         dest = parse_publish_destination(endpoint, self._config)
+        if self._config.lan_access and not (
+            dest.scheme == "rtsp" and is_loopback_host(dest.host)
+        ):
+            raise ConfigurationError(
+                "lan_access only applies to a local RTSP shorthand or loopback rtsp:// URL"
+            )
+        wants_side_outputs = bool(self._config.record_path or self._config.hls_output_dir)
+        if wants_side_outputs and dest.scheme == "srt":
+            raise ConfigurationError(
+                "record_path and hls_output_dir require an RTSP publish destination"
+            )
 
         if use_audio_passthrough:
             w = h = 0
             fps = 0.0
         else:
             w, h, fps = self._infer_publish_params()
-
-        if self._config.hls_output_dir:
-            Path(self._config.hls_output_dir).mkdir(parents=True, exist_ok=True)
-        if self._config.record_path:
-            Path(self._config.record_path).parent.mkdir(parents=True, exist_ok=True)
 
         self._config.ffmpeg_children.clear()
         self._publish_error = None
@@ -356,16 +411,33 @@ class Stream:
                         fd, tmp = tempfile.mkstemp(suffix=".yml", prefix="easy-rtsp-mediamtx-")
                         os.close(fd)
                         cfg_path = Path(tmp)
-                        write_minimal_mediamtx_config(
-                            cfg_path,
-                            _path_name,
-                            port,
-                            webrtc_enabled=self._config.webrtc_enabled,
-                            webrtc_http_port=self._config.webrtc_http_port,
-                        )
-                        self._backend = MediaMTXProcess.start(cfg_path)
-                        time.sleep(0.25)
+                        try:
+                            write_minimal_mediamtx_config(
+                                cfg_path,
+                                _path_name,
+                                port,
+                                lan_access=self._config.lan_access,
+                                listen_host=host,
+                                webrtc_enabled=self._config.webrtc_enabled,
+                                webrtc_http_port=self._config.webrtc_http_port,
+                            )
+                            self._backend = MediaMTXProcess.start(cfg_path)
+                            if not wait_for_tcp_listener(host, port):
+                                self._backend.stop()
+                                self._backend = None
+                                raise PublishError(
+                                    f"MediaMTX started but did not listen on {host}:{port} within 5s"
+                                )
+                        except BaseException:
+                            with suppress(OSError):
+                                cfg_path.unlink()
+                            raise
                     else:
+                        if self._config.lan_access:
+                            raise DependencyError(
+                                "LAN RTSP requires MediaMTX; the built-in fallback is not an RTSP "
+                                f"server. Install it with: {INSTALL_MEDIAMTX_CLI}"
+                            )
                         tcp_mpegts_listen = True
                         _logger.warning(
                             "MediaMTX is not installed or not on PATH. "
@@ -382,6 +454,19 @@ class Stream:
         else:
             raise ConfigurationError(f"Unsupported serve() scheme: {dest.scheme!r}")
 
+        if wants_side_outputs and tcp_mpegts_listen:
+            raise ConfigurationError(
+                "record_path and hls_output_dir need MediaMTX or an existing RTSP server; "
+                f"the TCP fallback cannot create side outputs. Install MediaMTX with: "
+                f"{INSTALL_MEDIAMTX_CLI}"
+            )
+        if self._config.hls_output_dir:
+            Path(self._config.hls_output_dir).mkdir(parents=True, exist_ok=True)
+        if self._config.record_path:
+            Path(self._config.record_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self._publish_started_at = time.monotonic()
+        self._publish_ended_at = None
         self._set_state(StreamState.RUNNING)
         self._serve_started = True
 
@@ -392,6 +477,7 @@ class Stream:
             self._publish_ended_at = time.monotonic()
             self._publish_error = err
             if err is not None:
+                _logger.error("publishing stopped with an error: %s", err)
                 self._set_state(StreamState.ERROR)
             else:
                 self._set_state(StreamState.STOPPED)
@@ -401,33 +487,44 @@ class Stream:
             if backend is not None:
                 backend.stop()
 
-        if use_audio_passthrough:
-            assert isinstance(self._source, RtspSource)
-            self._publish_thread = start_rtsp_passthrough_thread(
-                self._source._url,
-                config=self._config,
-                proc_holder=self._config.ffmpeg_children,
-                stop_event=self._stop_event,
-                on_done=on_done,
-                rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
-                srt_push_url=srt_push_url,
-                tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
-            )
-        else:
-            self._publish_thread = start_publish_thread(
-                factory,
-                width=w,
-                height=h,
-                fps=fps,
-                config=self._config,
-                proc_holder=self._config.ffmpeg_children,
-                on_done=on_done,
-                rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
-                srt_push_url=srt_push_url,
-                tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
-            )
+        try:
+            if use_audio_passthrough:
+                assert isinstance(self._source, RtspSource)
+                self._publish_thread = start_rtsp_passthrough_thread(
+                    self._source._url,
+                    config=self._config,
+                    proc_holder=self._config.ffmpeg_children,
+                    stop_event=self._stop_event,
+                    on_done=on_done,
+                    rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
+                    srt_push_url=srt_push_url,
+                    tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
+                )
+            else:
+                self._publish_thread = start_publish_thread(
+                    factory,
+                    width=w,
+                    height=h,
+                    fps=fps,
+                    config=self._config,
+                    proc_holder=self._config.ffmpeg_children,
+                    on_done=on_done,
+                    rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
+                    srt_push_url=srt_push_url,
+                    tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
+                )
+        except BaseException as e:
+            self._publish_ended_at = time.monotonic()
+            self._publish_error = e
+            self._serve_started = False
+            self._set_state(StreamState.ERROR)
+            self._wait_event.set()
+            if self._backend is not None:
+                self._backend.stop()
+                self._backend = None
+            raise
         if tcp_mpegts_listen:
-            self._viewer_url = f"tcp://{dest.host}:{dest.port}"
+            self._viewer_url = f"tcp://{format_url_host(dest.host)}:{dest.port}"
         else:
             self._viewer_url = dest.url
 
@@ -439,6 +536,17 @@ class Stream:
             self._webrtc_play_url = (
                 f"http://{dest.host}:{self._config.webrtc_http_port}/{dest.path_name}"
             )
+        if self._backend is not None and self._config.lan_access:
+            lan_hosts = discover_lan_hosts()
+            self._lan_viewer_urls = tuple(
+                f"rtsp://{format_url_host(host)}:{dest.port}/{dest.path_name}"
+                for host in lan_hosts
+            )
+            if self._config.webrtc_enabled:
+                self._lan_webrtc_play_urls = tuple(
+                    f"http://{host}:{self._config.webrtc_http_port}/{dest.path_name}"
+                    for host in lan_hosts
+                )
         return self
 
     def serve_rtsp(
@@ -498,9 +606,11 @@ class Stream:
         children = list(self._config.ffmpeg_children)
         for proc in children:
             if proc is not None and proc.poll() is None:
-                proc.terminate()
+                with suppress(OSError):
+                    proc.terminate()
         # Give FFmpeg a moment to exit, then hard-kill anything still running (orphan/zombie guard).
-        time.sleep(0.25)
+        if children:
+            time.sleep(0.25)
         for proc in children:
             if proc is not None and proc.poll() is None:
                 try:
@@ -543,7 +653,13 @@ class Stream:
                 fps = p.fps if p.fps and p.fps > 0 else 30.0
             return p.width, p.height, fps
         if isinstance(s, RtspSource):
-            p = probe_video(s._url)
+            p = probe_video(
+                s._url,
+                input_args=ffmpeg_rtsp_input_options(
+                    self._config.transport,
+                    self._config.latency_ms,
+                ),
+            )
             fps = p.fps if p.fps and p.fps > 0 else fps_default
             return p.width, p.height, fps
         if isinstance(s, WebcamSource):
@@ -567,12 +683,16 @@ class Stream:
 
 
 def _stream_config_from_kwargs(**kwargs: Any) -> StreamConfig:
+    return StreamConfig(**_stream_options_from_kwargs(**kwargs))
+
+
+def _stream_options_from_kwargs(**kwargs: Any) -> dict[str, Any]:
     fields = {f.name for f in dataclasses.fields(StreamConfig)}
     unknown = set(kwargs) - fields
     if unknown:
         raise ConfigurationError(f"Unknown stream options: {sorted(unknown)}")
-    return StreamConfig(**kwargs)
+    return kwargs
 
 
 def _is_rtsp_source(source: Any) -> bool:
-    return source.__class__.__name__ == "RtspSource"
+    return isinstance(RtspSource, type) and isinstance(source, RtspSource)

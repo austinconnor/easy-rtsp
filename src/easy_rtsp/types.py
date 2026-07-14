@@ -27,6 +27,8 @@ class StreamStatus:
     latest_frame_available: bool
     viewer_url: str | None
     webrtc_play_url: str | None
+    lan_viewer_urls: tuple[str, ...]
+    lan_webrtc_play_urls: tuple[str, ...]
     publish_error: str | None
     created_at: float
     last_state_change_at: float

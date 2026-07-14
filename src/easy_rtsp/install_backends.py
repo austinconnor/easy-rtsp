@@ -8,7 +8,7 @@ import tarfile
 import urllib.error
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from easy_rtsp.exceptions import DependencyError
@@ -42,14 +42,32 @@ def _platform_asset_suffix() -> str:
 
     system = platform.system()
     machine = platform.machine().lower()
+    amd64 = {"amd64", "x86_64", "x64"}
+    arm64 = {"aarch64", "arm64"}
     if system == "Linux":
-        arch = "arm64" if machine in ("aarch64", "arm64") else "amd64"
+        if machine in amd64:
+            arch = "amd64"
+        elif machine in arm64:
+            arch = "arm64"
+        elif machine in {"armv7l", "armv7"}:
+            arch = "armv7"
+        elif machine in {"armv6l", "armv6"}:
+            arch = "armv6"
+        else:
+            raise DependencyError(f"Unsupported Linux architecture: {machine}")
         return f"linux_{arch}.tar.gz"
     if system == "Darwin":
-        arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
+        if machine in amd64:
+            arch = "amd64"
+        elif machine in arm64:
+            arch = "arm64"
+        else:
+            raise DependencyError(f"Unsupported macOS architecture: {machine}")
         return f"darwin_{arch}.tar.gz"
     if system == "Windows":
-        return "windows_amd64.zip"
+        if machine in amd64:
+            return "windows_amd64.zip"
+        raise DependencyError(f"Unsupported Windows architecture: {machine}")
     raise DependencyError(f"Unsupported platform for bundled MediaMTX download: {system} {machine}")
 
 
@@ -88,7 +106,10 @@ def _extract_mediamtx_binary(archive: Path, dest_bin: Path) -> None:
     if archive.suffix == ".zip" or archive.name.endswith(".zip"):
         with zipfile.ZipFile(archive, "r") as zf:
             names = zf.namelist()
-            exe = next((n for n in names if n.endswith("mediamtx.exe") or n.endswith("/mediamtx.exe")), None)
+            exe = next(
+                (n for n in names if PurePosixPath(n).name.lower() == "mediamtx.exe"),
+                None,
+            )
             if not exe:
                 raise DependencyError("mediamtx.exe not found in zip")
             data = zf.read(exe)
@@ -96,12 +117,13 @@ def _extract_mediamtx_binary(archive: Path, dest_bin: Path) -> None:
     else:
         with tarfile.open(archive, "r:*") as tf:
             member = next(
-                (m for m in tf.getmembers() if m.isfile() and m.name.endswith("/mediamtx")),
+                (
+                    m
+                    for m in tf.getmembers()
+                    if m.isfile() and PurePosixPath(m.name).name == "mediamtx"
+                ),
                 None,
             )
-            if member is None:
-                # flat layout
-                member = next((m for m in tf.getmembers() if m.isfile() and m.name == "mediamtx"), None)
             if member is None:
                 raise DependencyError("mediamtx binary not found in archive")
             f = tf.extractfile(member)

@@ -8,6 +8,8 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from easy_rtsp.install_backends import print_ffmpeg_install_hints, run_install_backends
 
 
@@ -62,6 +64,26 @@ def test_install_mediamtx_download_mocked(tmp_path: Path) -> None:
     assert dest is not None
     assert dest.exists()
     assert dest.stat().st_size > 0
+
+
+def test_linux_armv7_asset_is_selected() -> None:
+    from easy_rtsp.install_backends import _platform_asset_suffix
+
+    with patch("platform.system", return_value="Linux"), patch(
+        "platform.machine", return_value="armv7l"
+    ):
+        assert _platform_asset_suffix() == "linux_armv7.tar.gz"
+
+
+def test_unknown_architecture_is_not_mistaken_for_amd64() -> None:
+    from easy_rtsp.exceptions import DependencyError
+    from easy_rtsp.install_backends import _platform_asset_suffix
+
+    with patch("platform.system", return_value="Linux"), patch(
+        "platform.machine", return_value="mips64"
+    ):
+        with pytest.raises(DependencyError, match="Unsupported Linux architecture"):
+            _platform_asset_suffix()
 
 
 class _FakeResp:

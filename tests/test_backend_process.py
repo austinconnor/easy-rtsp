@@ -17,7 +17,7 @@ def test_mediamtx_start_cleans_config_on_immediate_exit(tmp_path: Path) -> None:
     config_path.write_text("paths: {}\n", encoding="utf-8")
 
     proc = MagicMock()
-    proc.stderr = BytesIO(b"startup failed")
+    proc.stdout = BytesIO(b"startup failed")
     proc.poll.return_value = 1
     proc.returncode = 1
 

@@ -120,6 +120,12 @@ def test_status_reports_publish_error_after_failure() -> None:
     assert status.publish_thread_alive is False
 
 
+def test_status_names_exception_when_message_is_empty() -> None:
+    stream = Stream.from_frames(_frame_gen, fps=30.0, size=(12, 8))
+    stream._publish_error = KeyboardInterrupt()
+    assert stream.status().publish_error == "KeyboardInterrupt"
+
+
 def test_status_tracks_frame_timestamps_and_drop_count() -> None:
     def gen():
         for i in range(1, 4):

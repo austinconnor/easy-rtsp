@@ -9,8 +9,13 @@ import numpy as np
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import DependencyError, SourceError
-from easy_rtsp.ffmpeg_util import ffmpeg_ingest_rtsp_args, probe_video
+from easy_rtsp.ffmpeg_util import (
+    ffmpeg_ingest_rtsp_args,
+    ffmpeg_rtsp_input_options,
+    probe_video,
+)
 from easy_rtsp.log import get_logger
+from easy_rtsp.serve_url import redact_url_credentials
 from easy_rtsp.sources.base import ensure_bgr_uint8
 from easy_rtsp.sources.decode import iter_raw_bgr_frames
 
@@ -44,14 +49,21 @@ class RtspSource:
 
     def frames(self) -> Iterator[np.ndarray]:
         """Yield decoded frames; reconnects according to :class:`~easy_rtsp.config.StreamConfig`."""
+        safe_url = redact_url_credentials(self._url)
         while True:
             try:
-                probe = probe_video(self._url)
+                probe = probe_video(
+                    self._url,
+                    input_args=ffmpeg_rtsp_input_options(
+                        self._config.transport,
+                        self._config.latency_ms,
+                    ),
+                )
             except DependencyError:
                 raise
             except Exception as e:
                 if not self._config.reconnect or self._reconnect_exhausted():
-                    raise SourceError(f"RTSP probe failed for {self._url!r}: {e}") from e
+                    raise SourceError(f"RTSP probe failed for {safe_url!r}: {e}") from e
                 self._notify_reconnect("probe_failed")
                 continue
 
@@ -77,7 +89,8 @@ class RtspSource:
             except SourceError as e:
                 if not self._config.reconnect or self._reconnect_exhausted():
                     raise SourceError(
-                        f"RTSP decode failed for {self._url!r} (reconnect_count={self._reconnect_count}): {e}"
+                        f"RTSP decode failed for {safe_url!r} "
+                        f"(reconnect_count={self._reconnect_count}): {e}"
                     ) from e
                 self._notify_reconnect("decode_failed")
                 continue

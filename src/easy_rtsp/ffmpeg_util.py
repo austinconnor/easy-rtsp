@@ -9,37 +9,51 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from easy_rtsp.exceptions import DependencyError
+from easy_rtsp.exceptions import DependencyError, SourceError
+from easy_rtsp.serve_url import redact_url_credentials
+
+_PROBE_TIMEOUT_SEC = 15.0
 
 
 def _which(name: str) -> str | None:
     return shutil.which(name)
 
+
+def _resolve_executable(name: str, env_var: str, *, required: bool) -> str | None:
+    override = os.environ.get(env_var)
+    if override:
+        path = _which(os.path.expanduser(override))
+        if path:
+            return path
+        raise DependencyError(
+            f"{env_var} is set to {override!r}, but that executable could not be found or run."
+        )
+    path = _which(name)
+    if path or not required:
+        return path
+    raise DependencyError(
+        f"{name} not found on PATH. Install FFmpeg and ensure it is available, "
+        f"or set {env_var} to the executable path."
+    )
+
+
 def resolve_ffmpeg() -> str:
     """Return path to ``ffmpeg`` or raise :class:`DependencyError`."""
-    path = os.environ.get("EASY_RTSP_FFMPEG") or _which("ffmpeg")
-    if not path:
-        raise DependencyError(
-            "ffmpeg not found on PATH. Install FFmpeg and ensure it is available, "
-            "or set EASY_RTSP_FFMPEG to the FFmpeg executable path."
-        )
+    path = _resolve_executable("ffmpeg", "EASY_RTSP_FFMPEG", required=True)
+    assert path is not None
     return path
 
 
 def resolve_ffprobe() -> str:
     """Return path to ``ffprobe`` or raise :class:`DependencyError`."""
-    path = os.environ.get("EASY_RTSP_FFPROBE") or _which("ffprobe")
-    if not path:
-        raise DependencyError(
-            "ffprobe not found on PATH. Install FFmpeg (includes ffprobe) "
-            "or set EASY_RTSP_FFPROBE to the ffprobe executable path."
-        )
+    path = _resolve_executable("ffprobe", "EASY_RTSP_FFPROBE", required=True)
+    assert path is not None
     return path
 
 
 def resolve_mediamtx() -> str | None:
     """Return path to ``mediamtx`` if ``PATH`` or ``EASY_RTSP_MEDIAMTX`` is set."""
-    return os.environ.get("EASY_RTSP_MEDIAMTX") or _which("mediamtx")
+    return _resolve_executable("mediamtx", "EASY_RTSP_MEDIAMTX", required=False)
 
 
 @dataclass(frozen=True)
@@ -67,9 +81,16 @@ def _parse_fps(rate: str | None) -> float | None:
         return None
 
 
-def probe_video(path: str, ffprobe_bin: str | None = None) -> VideoProbe:
+def probe_video(
+    path: str,
+    ffprobe_bin: str | None = None,
+    *,
+    input_args: list[str] | None = None,
+    timeout_sec: float = _PROBE_TIMEOUT_SEC,
+) -> VideoProbe:
     """Probe width/height and nominal FPS for a URL or file path."""
     ffprobe = ffprobe_bin or resolve_ffprobe()
+    safe_path = redact_url_credentials(path)
     cmd = [
         ffprobe,
         "-v",
@@ -80,30 +101,48 @@ def probe_video(path: str, ffprobe_bin: str | None = None) -> VideoProbe:
         "stream=width,height,r_frame_rate",
         "-of",
         "json",
+        *(input_args or []),
         path,
     ]
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.PIPE, text=True)
+        out = subprocess.check_output(
+            cmd,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+        )
     except FileNotFoundError as e:
         raise DependencyError("ffprobe could not be executed.") from e
+    except subprocess.TimeoutExpired as e:
+        raise SourceError(f"ffprobe timed out after {timeout_sec:g}s for {safe_path!r}") from e
     except subprocess.CalledProcessError as e:
-        raise DependencyError(f"ffprobe failed for {path!r}: {e.stderr or e}") from e
+        detail = str(e.stderr or e).replace(path, safe_path)
+        raise SourceError(f"ffprobe failed for {safe_path!r}: {detail}") from e
 
-    data: dict[str, Any] = json.loads(out)
+    try:
+        data: dict[str, Any] = json.loads(out)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise SourceError(f"ffprobe returned invalid JSON for {safe_path!r}") from e
     streams = data.get("streams") or []
     if not streams:
-        raise DependencyError(f"No video stream found for {path!r}")
+        raise SourceError(f"No video stream found for {safe_path!r}")
     s0 = streams[0]
     w, h = s0.get("width"), s0.get("height")
-    if not isinstance(w, int) or not isinstance(h, int):
-        raise DependencyError(f"ffprobe did not return width/height for {path!r}")
+    if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+        raise SourceError(f"ffprobe did not return width/height for {safe_path!r}")
     fps = _parse_fps(s0.get("r_frame_rate"))
     return VideoProbe(width=w, height=h, fps=fps)
 
 
 def ffmpeg_ingest_rtsp_args(url: str, transport: str, latency_ms: int | None) -> list[str]:
+    args = ffmpeg_rtsp_input_options(transport, latency_ms)
+    args += ["-i", url]
+    return args
+
+
+def ffmpeg_rtsp_input_options(transport: str, latency_ms: int | None) -> list[str]:
+    """Return FFmpeg/ffprobe RTSP options that must appear before the input URL."""
     args: list[str] = ["-rtsp_transport", transport]
     if latency_ms is not None:
         args += ["-max_delay", str(latency_ms * 1000)]
-    args += ["-i", url]
     return args

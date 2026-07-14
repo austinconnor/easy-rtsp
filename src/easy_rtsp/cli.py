@@ -8,9 +8,13 @@ import signal
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+from easy_rtsp import __version__
 from easy_rtsp.config import StreamConfig
+from easy_rtsp.exceptions import EasyRtspError
 from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
+from easy_rtsp.serve_url import redact_url_credentials
 
 
 def _install_sigint_stop(stream: object):
@@ -44,18 +48,46 @@ def _print_play_url(stream: object) -> None:
     webrtc = getattr(stream, "webrtc_play_url", None)
     if webrtc:
         print(f"WebRTC: {webrtc}", flush=True)
-        if "127.0.0.1" in webrtc or "localhost" in webrtc.lower():
-            print(
-                "  Open in a browser; on a phone use this machine's LAN IP instead of 127.0.0.1.",
-                file=sys.stderr,
-                flush=True,
-            )
+    for url in getattr(stream, "lan_viewer_urls", ()):
+        print(f"LAN: {url}", flush=True)
+    for url in getattr(stream, "lan_webrtc_play_urls", ()):
+        print(f"LAN WebRTC: {url}", flush=True)
+    lan_urls = getattr(stream, "lan_viewer_urls", ())
+    if lan_urls:
+        port = urlparse(lan_urls[0]).port or 8554
+        print(
+            "  LAN mode has no authentication; use it only on a trusted network. "
+            f"Allow inbound TCP {port} in the host firewall if needed.",
+            file=sys.stderr,
+            flush=True,
+        )
+        if getattr(stream, "lan_webrtc_play_urls", ()):
+            webrtc_port = getattr(getattr(stream, "config", None), "webrtc_http_port", 8889)
             print(
                 "  If WebRTC stays on loading: disable VPN for a test, try another browser, "
-                "and use MediaMTX 1.11.2+ (firewall: UDP/TCP 8189 for mediamtx).",
+                f"and allow TCP {webrtc_port} plus UDP/TCP 8189 for MediaMTX.",
                 file=sys.stderr,
                 flush=True,
             )
+
+
+def _wait_for_stream(stream: object) -> int:
+    """Print playback details, wait for shutdown, and surface background failures."""
+    _print_play_url(stream)
+    prev = _install_sigint_stop(stream)
+    try:
+        stream.wait()
+    except KeyboardInterrupt:
+        stream.stop()
+    finally:
+        if prev is not None:
+            signal.signal(signal.SIGINT, prev)
+
+    status = stream.status()
+    if status.has_publish_error:
+        print(f"error: {status.publish_error or 'publishing failed'}", file=sys.stderr, flush=True)
+        return 1
+    return 0
 
 
 def cmd_install_backends(args: argparse.Namespace) -> int:
@@ -97,8 +129,12 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"  ffprobe:  MISSING ({e})")
 
-    mtx = resolve_mediamtx()
-    print(f"  mediamtx: {mtx or 'not found on PATH (optional for local publish)'}")
+    try:
+        mtx = resolve_mediamtx()
+        print(f"  mediamtx: {mtx or 'not found on PATH (optional for local publish)'}")
+    except Exception as e:
+        mtx = None
+        print(f"  mediamtx: MISCONFIGURED ({e})")
     if not mtx:
         print(f"  warning:  install MediaMTX for rtsp:// and WebRTC: {INSTALL_MEDIAMTX_CLI}", flush=True)
 
@@ -113,6 +149,7 @@ def _config_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         max_reconnect_attempts=args.max_reconnect_attempts,
         server_host=args.server_host,
         server_port=args.server_port,
+        lan_access=bool(getattr(args, "lan", False)),
     )
     if getattr(args, "low_latency_input", False):
         d["input_realtime_pace"] = False
@@ -142,22 +179,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
     from easy_rtsp import Stream
 
     print(
-        f"easy-rtsp: relay {args.url!r} -> --serve {args.serve!r} (Ctrl+C to stop)",
+        f"easy-rtsp: relay {redact_url_credentials(args.url)!r} "
+        f"-> --serve {redact_url_credentials(args.serve)!r} (Ctrl+C to stop)",
         file=sys.stderr,
         flush=True,
     )
     kwargs = _config_kwargs_from_args(args)
     stream = Stream.open(args.url, **kwargs).serve(args.serve)
-    _print_play_url(stream)
-    prev = _install_sigint_stop(stream)
-    try:
-        stream.wait()
-    except KeyboardInterrupt:
-        stream.stop()
-    finally:
-        if prev is not None:
-            signal.signal(signal.SIGINT, prev)
-    return 0
+    return _wait_for_stream(stream)
 
 
 def cmd_webcam(args: argparse.Namespace) -> int:
@@ -171,16 +200,7 @@ def cmd_webcam(args: argparse.Namespace) -> int:
     )
     kwargs = _config_kwargs_from_args(args)
     stream = Stream.from_webcam(args.index, **kwargs).serve(args.serve)
-    _print_play_url(stream)
-    prev = _install_sigint_stop(stream)
-    try:
-        stream.wait()
-    except KeyboardInterrupt:
-        stream.stop()
-    finally:
-        if prev is not None:
-            signal.signal(signal.SIGINT, prev)
-    return 0
+    return _wait_for_stream(stream)
 
 
 def cmd_file(args: argparse.Namespace) -> int:
@@ -190,7 +210,7 @@ def cmd_file(args: argparse.Namespace) -> int:
     kwargs = _config_kwargs_from_args(args)
     if getattr(args, "no_realtime", False):
         kwargs["input_realtime_pace"] = False
-    path = Path(args.path)
+    path = Path(args.path).expanduser()
     if not path.is_file():
         print(f"error: not a file: {path}", file=sys.stderr)
         return 2
@@ -200,16 +220,7 @@ def cmd_file(args: argparse.Namespace) -> int:
         flush=True,
     )
     stream = Stream.from_file(path, **kwargs).serve(args.serve)
-    _print_play_url(stream)
-    prev = _install_sigint_stop(stream)
-    try:
-        stream.wait()
-    except KeyboardInterrupt:
-        stream.stop()
-    finally:
-        if prev is not None:
-            signal.signal(signal.SIGINT, prev)
-    return 0
+    return _wait_for_stream(stream)
 
 
 def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
@@ -288,6 +299,11 @@ def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="FFmpeg video encoder (e.g. h264_nvenc, h264_qsv); default is libx264 for H.264",
     )
     p.add_argument(
+        "--lan",
+        action="store_true",
+        help="Expose a locally started RTSP server to this network and print LAN playback URLs",
+    )
+    p.add_argument(
         "--audio-mode",
         choices=["off", "passthrough"],
         default=StreamConfig.audio_mode,
@@ -320,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="easy-rtsp",
         description="Ingest video and republish over RTSP (see also the Python API).",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_doc = sub.add_parser("doctor", help="Show FFmpeg/MediaMTX availability and platform info")
@@ -408,7 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     from easy_rtsp.log import setup_cli_logging
 
     setup_cli_logging(getattr(args, "verbose", False))
-    code = args.func(args)
+    try:
+        code = args.func(args)
+    except (EasyRtspError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr, flush=True)
+        return 1
     return int(code) if code is not None else 0
 
 

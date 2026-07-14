@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from easy_rtsp import ConfigurationError, ProcessingError, Stream
+from easy_rtsp import ConfigurationError, ProcessingError, PublishError, Stream
 from easy_rtsp.types import StreamState
 
 
@@ -107,6 +107,55 @@ def test_unknown_stream_kwarg_raises() -> None:
         Stream.from_frames((x for x in []), fps=30.0, size=(10, 10), not_a_field=True)  # type: ignore[call-arg]
 
 
+def test_serve_accepts_runtime_config_overrides() -> None:
+    with patch("easy_rtsp.stream.start_publish_thread"):
+        stream = Stream.from_frames(iter(()), fps=30.0, size=(10, 10))
+        stream.serve(
+            "srt://127.0.0.1:9000",
+            bitrate="1M",
+            preset="quality",
+            input_realtime_pace=False,
+        )
+
+    assert stream.config.bitrate == "1M"
+    assert stream.config.preset == "quality"
+    assert stream._source.config is stream.config
+    assert stream._source.config.input_realtime_pace is False
+
+
+def test_side_outputs_fail_early_without_rtsp_server(tmp_path: Path) -> None:
+    stream = Stream.from_frames(
+        iter(()),
+        fps=30.0,
+        size=(10, 10),
+        record_path=str(tmp_path / "out.mp4"),
+    )
+    with (
+        patch("easy_rtsp.stream.resolve_mediamtx", return_value=None),
+        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
+        patch("easy_rtsp.stream.start_publish_thread") as start_publish,
+        pytest.raises(ConfigurationError, match="need MediaMTX"),
+    ):
+        stream.serve("live")
+
+    start_publish.assert_not_called()
+
+
+def test_mediamtx_readiness_failure_cleans_up() -> None:
+    backend = MagicMock()
+    with (
+        patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
+        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
+        patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=backend),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=False),
+        patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
+        pytest.raises(PublishError, match="did not listen"),
+    ):
+        Stream.from_frames(iter(()), fps=30.0, size=(10, 10)).serve("live")
+
+    backend.stop.assert_called_once()
+
+
 def test_serve_twice_raises() -> None:
     from unittest.mock import MagicMock, patch
 
@@ -118,6 +167,7 @@ def test_serve_twice_raises() -> None:
         patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
         patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
         patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
         patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
         patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
         patch("easy_rtsp.stream.os.close"),

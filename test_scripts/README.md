@@ -2,7 +2,7 @@
 
 Run from the **repository root** with `uv run python test_scripts/<script>.py`.
 
-This folder is listed in `.gitignore` (entire directory). Remove the `test_scripts/` line from `.gitignore` if you want these examples in version control.
+These tracked scripts are manual integration examples; the deterministic automated checks live under `tests/`.
 
 | Script | What it exercises |
 |--------|-------------------|

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from easy_rtsp.config import StreamConfig
+from easy_rtsp.exceptions import PublishError
 from easy_rtsp.publish import (
     build_raw_publish_ffmpeg_cmd,
     build_rtsp_passthrough_ffmpeg_cmd,
@@ -107,9 +109,24 @@ def test_build_tee_record_and_hls(tmp_path) -> None:
     )
     assert "-f" in cmd
     assert "tee" in cmd
+    assert cmd[cmd.index("-map") + 1] == "0:v:0"
     joined = "|".join(cmd)
     assert "rtsp://" in joined
     assert "index.m3u8" in joined
+
+
+def test_build_tee_escapes_special_output_path(tmp_path) -> None:
+    output = tmp_path / "record | camera's view.mp4"
+    cmd = build_raw_publish_ffmpeg_cmd(
+        width=640,
+        height=480,
+        fps=30.0,
+        config=StreamConfig(record_path=str(output)),
+        rtsp_push_url="rtsp://127.0.0.1:8554/live",
+    )
+    tee_spec = cmd[-1]
+    assert "record | camera" in tee_spec
+    assert "'\\''" in tee_spec
 
 
 def test_build_rejects_tee_with_tcp_listen(tmp_path) -> None:
@@ -159,6 +176,29 @@ def test_build_rtsp_passthrough_tcp_listen_cmd() -> None:
     assert any("tcp://" in x and "listen=1" in x for x in cmd)
 
 
+def test_passthrough_rejects_side_output_with_srt(tmp_path) -> None:
+    with pytest.raises(PublishError, match="require RTSP push"):
+        build_rtsp_passthrough_ffmpeg_cmd(
+            source_url="rtsp://camera/live",
+            config=StreamConfig(
+                audio_mode="passthrough",
+                record_path=str(tmp_path / "out.mp4"),
+            ),
+            srt_push_url="srt://127.0.0.1:9000",
+        )
+
+
+def test_build_tcp_mpegts_brackets_ipv6() -> None:
+    cmd = build_raw_publish_ffmpeg_cmd(
+        width=640,
+        height=480,
+        fps=30.0,
+        config=StreamConfig(),
+        tcp_listen=("::1", 8554),
+    )
+    assert cmd[-1] == "tcp://[::1]:8554?listen=1"
+
+
 def test_run_publish_loop_tcp_listen() -> None:
     holder: list[object] = []
     with (
@@ -167,7 +207,7 @@ def test_run_publish_loop_tcp_listen() -> None:
     ):
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
-        mock_proc.stderr = None
+        mock_proc.stderr = BytesIO(b"")
         mock_proc.poll.return_value = 0
         mock_proc.wait.return_value = 0
         p.return_value = mock_proc
@@ -195,7 +235,7 @@ def test_run_publish_loop_rtsp_push() -> None:
     ):
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
-        mock_proc.stderr = None
+        mock_proc.stderr = BytesIO(b"")
         mock_proc.poll.return_value = 0
         mock_proc.wait.return_value = 0
         p.return_value = mock_proc
@@ -224,6 +264,7 @@ def test_run_rtsp_passthrough_loop_rtsp_push() -> None:
         patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
     ):
         mock_proc = MagicMock()
+        mock_proc.stderr = BytesIO(b"")
         mock_proc.poll.return_value = 0
         mock_proc.wait.return_value = 0
         p.return_value = mock_proc
@@ -238,3 +279,26 @@ def test_run_rtsp_passthrough_loop_rtsp_push() -> None:
         args = p.call_args[0][0]
         assert args[-1] == "rtsp://127.0.0.1:9/x"
     assert holder == []
+
+
+def test_publish_failure_includes_ffmpeg_diagnostics() -> None:
+    with (
+        patch("easy_rtsp.publish.subprocess.Popen") as p,
+        patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
+    ):
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = BytesIO(b"unknown encoder h264_missing")
+        mock_proc.poll.return_value = 1
+        mock_proc.wait.return_value = 1
+        p.return_value = mock_proc
+
+        with pytest.raises(PublishError, match="unknown encoder h264_missing"):
+            run_publish_loop(
+                iter([]),
+                width=64,
+                height=48,
+                fps=1.0,
+                config=StreamConfig(),
+                rtsp_push_url="rtsp://127.0.0.1:9/x",
+            )

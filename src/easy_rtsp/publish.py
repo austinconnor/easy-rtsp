@@ -15,7 +15,8 @@ from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import PublishError
 from easy_rtsp.ffmpeg_util import ffmpeg_ingest_rtsp_args, resolve_ffmpeg
 from easy_rtsp.log import get_logger
-from easy_rtsp.process_io import discard_process
+from easy_rtsp.process_io import decode_tail_bytes, discard_process, start_tail_reader
+from easy_rtsp.serve_url import format_url_host
 
 _plog = get_logger("publish")
 
@@ -79,16 +80,21 @@ def _norm_fs_path(p: str) -> str:
     return str(Path(p).expanduser().resolve()).replace("\\", "/")
 
 
+def _escape_tee_slave(value: str) -> str:
+    """Escape a tee slave name for FFmpeg's own parser (the command does not use a shell)."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def _build_tee_spec(rtsp_url: str, config: StreamConfig) -> str:
-    parts: list[str] = [f"[f=rtsp:rtsp_transport=tcp]{rtsp_url}"]
+    parts: list[str] = [f"[f=rtsp:rtsp_transport=tcp]{_escape_tee_slave(rtsp_url)}"]
     if config.record_path:
-        parts.append(f"[f=mp4]{_norm_fs_path(config.record_path)}")
+        parts.append(f"[f=mp4]{_escape_tee_slave(_norm_fs_path(config.record_path))}")
     if config.hls_output_dir:
         playlist = Path(config.hls_output_dir).expanduser() / "index.m3u8"
         st = float(config.hls_segment_time)
         parts.append(
             f"[f=hls:hls_time={st}:hls_list_size=0:hls_flags=delete_segments]"
-            f"{_norm_fs_path(str(playlist))}"
+            f"{_escape_tee_slave(_norm_fs_path(str(playlist)))}"
         )
     return "|".join(parts)
 
@@ -170,7 +176,7 @@ def build_raw_publish_ffmpeg_cmd(
 
     if tcp_listen is not None:
         host, port = tcp_listen
-        dest = f"tcp://{host}:{port}?listen=1"
+        dest = f"tcp://{format_url_host(host)}:{port}?listen=1"
         return base + mux + ["-f", "mpegts", dest]
 
     if srt_push_url is not None:
@@ -180,7 +186,7 @@ def build_raw_publish_ffmpeg_cmd(
     assert rtsp_push_url is not None
     if wants_side:
         tee_arg = _build_tee_spec(rtsp_push_url, config)
-        return base + ["-f", "tee", tee_arg]
+        return base + ["-map", "0:v:0", "-f", "tee", tee_arg]
     return base + mux + ["-f", "rtsp", "-rtsp_transport", "tcp", rtsp_push_url]
 
 
@@ -200,6 +206,14 @@ def build_rtsp_passthrough_ffmpeg_cmd(
     n_dest = sum(1 for x in (rtsp_push_url, srt_push_url, tcp_listen) if x is not None)
     if n_dest != 1:
         raise PublishError("internal: specify exactly one of rtsp_push_url, srt_push_url, tcp_listen")
+
+    if (config.record_path or config.hls_output_dir) and (
+        tcp_listen is not None or srt_push_url is not None
+    ):
+        raise PublishError(
+            "record_path and hls_output_dir require RTSP push (tee muxer); "
+            "not compatible with SRT-only or TCP MPEG-TS listen mode."
+        )
 
     input_args = config.extra_ffmpeg_input_args + ffmpeg_ingest_rtsp_args(
         source_url,
@@ -223,7 +237,7 @@ def build_rtsp_passthrough_ffmpeg_cmd(
 
     if tcp_listen is not None:
         host, port = tcp_listen
-        dest = f"tcp://{host}:{port}?listen=1"
+        dest = f"tcp://{format_url_host(host)}:{port}?listen=1"
         return base + mux + ["-f", "mpegts", dest]
 
     if srt_push_url is not None:
@@ -249,7 +263,6 @@ def run_publish_loop(
     tcp_listen: tuple[str, int] | None = None,
 ) -> None:
     """Blocking: encode frames from *frame_iter* and send to RTSP, SRT, or TCP listen."""
-    resolve_ffmpeg()
     cmd = build_raw_publish_ffmpeg_cmd(
         width=width,
         height=height,
@@ -261,18 +274,25 @@ def run_publish_loop(
     )
     ffmpeg = resolve_ffmpeg()
     proc: subprocess.Popen[bytes] | None = None
+    stderr_tail = bytearray()
+    stderr_thread: threading.Thread | None = None
+    frames_written = 0
     try:
         proc = subprocess.Popen(
             [ffmpeg, *cmd],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            # Never PIPE stderr without draining during the loop — FFmpeg can fill the buffer and
-            # block forever, leaking RAM and leaving a zombie child after Ctrl+C.
-            stderr=subprocess.DEVNULL,
+            # A background reader keeps diagnostics bounded without letting FFmpeg block on stderr.
+            stderr=subprocess.PIPE,
         )
         if proc_holder is not None:
             proc_holder.append(proc)
         assert proc.stdin is not None
+        assert proc.stderr is not None
+        stderr_tail, stderr_thread = start_tail_reader(
+            proc.stderr,
+            name="easy-rtsp-publish-stderr",
+        )
         if tcp_listen is not None:
             _plog.info("TCP MPEG-TS listen on tcp://%s:%s (connect a viewer)", tcp_listen[0], tcp_listen[1])
         if srt_push_url is not None:
@@ -285,20 +305,35 @@ def run_publish_loop(
                 )
             proc.stdin.write(frame.tobytes())
             proc.stdin.flush()
+            frames_written += 1
         proc.stdin.close()
-        code = proc.wait(timeout=120)
+        try:
+            code = proc.wait(timeout=120)
+        except subprocess.TimeoutExpired as e:
+            raise PublishError("ffmpeg publisher did not exit after the input stream ended") from e
         if code != 0:
-            raise PublishError(f"ffmpeg publisher exited with code {code}")
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+            raise _publisher_exit_error(code, stderr_tail)
     except BrokenPipeError:
-        pass
+        if frames_written == 0 and proc is not None:
+            code = proc.poll()
+            if code not in (None, 0, -15, 255):
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=1.0)
+                raise _publisher_exit_error(code, stderr_tail)
     except OSError as e:
         # Encoder stopped (stop() or viewer disconnect): EPIPE, or Windows winerror 232 / 109.
-        if e.errno in (errno.EPIPE, errno.ECONNRESET):
-            pass
-        elif getattr(e, "winerror", None) in (232, 109):
-            pass
-        elif e.errno == 232:
-            pass
+        if e.errno in (errno.EPIPE, errno.ECONNRESET) or getattr(e, "winerror", None) in (
+            232,
+            109,
+        ):
+            if frames_written == 0 and proc is not None:
+                code = proc.poll()
+                if code not in (None, 0, -15, 255):
+                    if stderr_thread is not None:
+                        stderr_thread.join(timeout=1.0)
+                    raise _publisher_exit_error(code, stderr_tail) from e
         else:
             raise
     except PublishError:
@@ -320,7 +355,15 @@ def run_publish_loop(
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         pass
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=5.0)
             discard_process(proc_holder, proc)
+
+
+def _publisher_exit_error(code: int, stderr_tail: bytearray) -> PublishError:
+    detail = decode_tail_bytes(stderr_tail).strip()
+    suffix = f": {detail[-4000:]}" if detail else ""
+    return PublishError(f"ffmpeg publisher exited with code {code}{suffix}")
 
 
 def run_rtsp_passthrough_loop(
@@ -334,12 +377,14 @@ def run_rtsp_passthrough_loop(
     tcp_listen: tuple[str, int] | None = None,
 ) -> None:
     """Blocking: relay RTSP video and audio directly to RTSP, SRT, or TCP listen."""
-    resolve_ffmpeg()
     ffmpeg = resolve_ffmpeg()
     attempt = 0
+    last_error_detail = ""
 
     while True:
         proc: subprocess.Popen[bytes] | None = None
+        stderr_tail = bytearray()
+        stderr_thread: threading.Thread | None = None
         reconnect_reason: str | None = None
         try:
             cmd = build_rtsp_passthrough_ffmpeg_cmd(
@@ -353,11 +398,18 @@ def run_rtsp_passthrough_loop(
                 [ffmpeg, *cmd],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             if proc_holder is not None:
                 proc_holder.append(proc)
+            assert proc.stderr is not None
+            stderr_tail, stderr_thread = start_tail_reader(
+                proc.stderr,
+                name="easy-rtsp-passthrough-stderr",
+            )
             code = proc.wait()
+            stderr_thread.join(timeout=1.0)
+            last_error_detail = decode_tail_bytes(stderr_tail).strip()
             if stop_event is not None and stop_event.is_set():
                 return
             if code == 0:
@@ -365,7 +417,7 @@ def run_rtsp_passthrough_loop(
             else:
                 reconnect_reason = "publish_exited"
                 if not config.reconnect:
-                    raise PublishError(f"ffmpeg passthrough publisher exited with code {code}")
+                    raise _publisher_exit_error(code, stderr_tail)
         finally:
             if proc is not None:
                 if proc.poll() is None:
@@ -378,6 +430,8 @@ def run_rtsp_passthrough_loop(
                             proc.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             pass
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5.0)
                 discard_process(proc_holder, proc)
 
         if stop_event is not None and stop_event.is_set():
@@ -386,7 +440,10 @@ def run_rtsp_passthrough_loop(
             return
         if config.max_reconnect_attempts is not None and attempt >= config.max_reconnect_attempts:
             if reconnect_reason == "publish_exited":
-                raise PublishError("ffmpeg passthrough publisher exhausted reconnect attempts")
+                suffix = f": {last_error_detail[-4000:]}" if last_error_detail else ""
+                raise PublishError(
+                    f"ffmpeg passthrough publisher exhausted reconnect attempts{suffix}"
+                )
             return
 
         attempt += 1
@@ -394,7 +451,11 @@ def run_rtsp_passthrough_loop(
             config.on_reconnecting(attempt)
         interval = max(0.0, float(config.retry_interval_sec))
         if interval:
-            time.sleep(interval)
+            if stop_event is not None:
+                if stop_event.wait(interval):
+                    return
+            else:
+                time.sleep(interval)
 
 
 def start_rtsp_passthrough_thread(

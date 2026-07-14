@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 from easy_rtsp import Stream
 
@@ -20,6 +21,7 @@ def test_viewer_url_rtsp_with_local_mediamtx() -> None:
         patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
         patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
         patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
         patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
         patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
         patch("easy_rtsp.stream.os.close"),
@@ -37,6 +39,7 @@ def test_webrtc_play_url_when_enabled_with_local_mediamtx() -> None:
         patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
         patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
         patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
         patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
         patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
         patch("easy_rtsp.stream.os.close"),
@@ -56,6 +59,7 @@ def test_webrtc_play_url_disabled_when_config_off() -> None:
         patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
         patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
         patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
         patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
         patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
         patch("easy_rtsp.stream.os.close"),
@@ -76,3 +80,36 @@ def test_viewer_url_tcp_without_mediamtx() -> None:
         s = Stream.from_frames(_infinite_frames(), fps=30, size=(64, 48))
         s.serve("live")
         assert s.viewer_url == "tcp://127.0.0.1:8554"
+
+
+def test_lan_mode_reports_ready_to_use_urls() -> None:
+    with (
+        patch("easy_rtsp.stream.start_publish_thread"),
+        patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
+        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
+        patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
+        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
+        patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
+        patch("easy_rtsp.stream.discover_lan_hosts", return_value=["192.168.1.42"]),
+        patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
+        patch("easy_rtsp.stream.os.close"),
+    ):
+        stream = Stream.from_frames(
+            _infinite_frames(), fps=30, size=(64, 48), lan_access=True, webrtc_enabled=True
+        ).serve("live")
+        assert stream.lan_viewer_urls == ("rtsp://192.168.1.42:8554/live",)
+        assert stream.lan_webrtc_play_urls == ("http://192.168.1.42:8889/live",)
+
+
+def test_lan_mode_requires_mediamtx() -> None:
+    from easy_rtsp.exceptions import DependencyError
+
+    with (
+        patch("easy_rtsp.stream.resolve_mediamtx", return_value=None),
+        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
+    ):
+        stream = Stream.from_frames(
+            _infinite_frames(), fps=30, size=(64, 48), lan_access=True
+        )
+        with pytest.raises(DependencyError, match="LAN RTSP requires MediaMTX"):
+            stream.serve("live")

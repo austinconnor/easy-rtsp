@@ -46,6 +46,10 @@ relay = Stream.open_rtsp(
 # Webcam -> transform -> publish
 Stream.from_webcam(0).map(process_frame).serve("live")
 
+# Make it reachable by other devices on the same network
+stream = Stream.from_webcam(0, lan_access=True).serve("live")
+print(stream.lan_viewer_urls)
+
 # File with options
 Stream.from_file("clip.mp4", file_loop=True).serve("live")
 
@@ -68,22 +72,25 @@ Commands:
 - `file` - publish from a file source
 - `doctor` - print FFmpeg, ffprobe, MediaMTX, and platform status
 - `install-backends` - show FFmpeg hints and optionally download MediaMTX
+- `--version` - print the installed easy-rtsp version
 
 Examples:
 
 ```bash
 easy-rtsp relay rtsp://camera/live --serve live
 easy-rtsp webcam 0 --serve live --webrtc
+easy-rtsp webcam 0 --serve live --lan
 easy-rtsp file input.mp4 --serve demo
 easy-rtsp file clip.mp4 --serve live --fps 24 --no-loop
 easy-rtsp relay rtsp://cam/live --serve live --record out.mp4 --hls-dir ./hls
 easy-rtsp doctor
+easy-rtsp --version
 easy-rtsp install-backends
 ```
 
-Shared `--serve` flags include endpoint, transport (relay), reconnect options, `--server-host` / `--server-port`, `--low-latency-input`, `--record`, `--hls-dir`, `--hls-segment-time`, `--video-encoder`, `--audio-mode`, `--webrtc` / `--no-webrtc`, `--webrtc-port`, and `-v`.
+Shared `--serve` flags include endpoint, transport (relay), reconnect options, `--server-host` / `--server-port`, `--lan`, `--low-latency-input`, `--record`, `--hls-dir`, `--hls-segment-time`, `--video-encoder`, `--audio-mode`, `--webrtc` / `--no-webrtc`, `--webrtc-port`, and `-v`.
 
-Logs go to **stderr**. `Play:` and `WebRTC:` URLs go to **stdout**. `SIGINT` is wired so `Ctrl+C` calls `stop()` reliably on Windows.
+Logs go to **stderr**. `Play:` and `WebRTC:` URLs go to **stdout**. `SIGINT` is wired so `Ctrl+C` calls `stop()` reliably on Windows. CLI commands return a non-zero exit code and print FFmpeg's useful error tail when publishing fails.
 
 ## Dependencies
 
@@ -105,7 +112,7 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 
 ### Ingest sources
 
-- **`Stream.open(url)`** - RTSP or RTSPS URL with reconnect and backoff.
+- **`Stream.open(url)`** - RTSP or RTSPS URL with configurable reconnect retries.
 - **`Stream.open_rtsp(host, path=..., username=..., password=...)`** - helper that builds a safe RTSP/RTSPS URL.
 - **`Stream.from_webcam(index)`** - camera via OpenCV.
 - **`Stream.from_file(path)`** - file decode; looping uses FFmpeg `-stream_loop`.
@@ -119,8 +126,10 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 
 - **Shorthand path** - `"live"` maps to `rtsp://127.0.0.1:8554/live` using `StreamConfig.server_host` / `server_port`.
 - **Full URLs** - `rtsp://`, `rtsps://`, and `srt://`.
+- RTSP query strings and multi-segment paths are preserved; IPv6 literals are bracketed automatically by the URL builders.
 - **`audio_mode="passthrough"`** - relay source audio for RTSP ingest when using `Stream.open(...)` / `Stream.open_rtsp(...)` without frame transforms.
 - **Local MediaMTX** - easy-rtsp writes a minimal config and starts MediaMTX when possible.
+- **LAN access** - set `lan_access=True` or pass `--lan`; easy-rtsp binds MediaMTX to the network and reports ready-to-copy URLs in `lan_viewer_urls` / CLI output.
 - **No MediaMTX** - FFmpeg listens for one MPEG-TS client over TCP.
 - **Existing server** - FFmpeg pushes RTSP in client mode when something is already listening.
 
@@ -144,11 +153,23 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 - **`on_reconnecting`** - optional callback `(attempt_number)`.
 - **`latency_ms`** - optional ingest hint.
 
-### WebRTC (optional, MediaMTX + loopback)
+### LAN access
+
+Local publishing is loopback-only by default. To watch from VLC or another RTSP client on a phone, TV, or computer connected to the same network:
+
+```bash
+easy-rtsp webcam 0 --serve live --lan
+```
+
+The CLI prints output such as `LAN: rtsp://192.168.1.42:8554/live`; open that exact URL on the other device. LAN RTSP requires MediaMTX, uses RTSP-over-TCP so only the selected RTSP TCP port is needed, and is unauthenticated—use it only on a trusted network. If the connection is blocked, allow inbound TCP port `8554` (or your `--server-port`) for MediaMTX in the host firewall. Client isolation on guest Wi-Fi can also prevent devices from reaching each other.
+
+Add `--webrtc` for browser playback. The CLI will also print `LAN WebRTC:` URLs; WebRTC additionally needs TCP `8889` and UDP/TCP `8189` by default.
+
+### WebRTC (optional, local MediaMTX)
 
 - **`webrtc_enabled`** - off by default.
 - **`webrtc_http_port`** - signaling port, default `8889`.
-- Use the machine's LAN IP instead of `127.0.0.1` when testing from another device on the same network.
+- Pair with `lan_access=True` / `--lan` for automatically reported browser URLs on other devices.
 
 ### File-specific
 
@@ -166,7 +187,7 @@ Set `EASY_RTSP_MEDIAMTX` to the `mediamtx` executable or add it to `PATH` after 
 - **`save_snapshot(path)`** - write the latest processed frame to an image file.
 - **`status()`** - get an immutable health snapshot with state, reconnect count, URLs, and error state.
 - **Context manager** - `with stream:` calls `stop()` on exit.
-- **`Stream.state`**, **`reconnect_count`**, **`viewer_url`**, **`webrtc_play_url`**.
+- **`Stream.state`**, **`reconnect_count`**, **`viewer_url`**, **`webrtc_play_url`**, **`lan_viewer_urls`**, **`lan_webrtc_play_urls`**.
 
 ## Releases
 

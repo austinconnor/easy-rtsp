@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import socket
 import subprocess
 import threading
@@ -14,7 +16,46 @@ from easy_rtsp.ffmpeg_util import resolve_mediamtx
 from easy_rtsp.process_io import decode_tail_bytes, start_tail_reader
 
 
-def discover_webrtc_additional_hosts() -> list[str]:
+def discover_lan_hosts() -> list[str]:
+    """Return usable IPv4 addresses for reaching this machine from the local network."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str) -> None:
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            return
+        if (
+            ip.version != 4
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_unspecified
+            or ip.is_multicast
+            or candidate in seen
+        ):
+            return
+        seen.add(candidate)
+        out.append(candidate)
+
+    # Ask the routing table first. No packets need to be sent for a UDP connect.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.2)
+            sock.connect(("8.8.8.8", 80))
+            add(sock.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        _hostname, _aliases, addresses = socket.gethostbyname_ex(socket.gethostname())
+        for address in addresses:
+            add(address)
+    except OSError:
+        pass
+    return out
+
+
+def discover_webrtc_additional_hosts(*, lan_access: bool = False) -> list[str]:
     """
     IPs to advertise in ICE for local MediaMTX WebRTC.
 
@@ -22,49 +63,33 @@ def discover_webrtc_additional_hosts() -> list[str]:
     same machine, LAN IP for phones). MediaMTX also recommends ``webrtcAdditionalHosts`` when
     connectivity fails behind NAT or strict firewalls.
     """
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add(ip: str) -> None:
-        if ip in seen:
-            return
-        # Skip APIPA / link-local noise from some Windows adapters.
-        if ip.startswith("169.254."):
-            return
-        seen.add(ip)
-        out.append(ip)
-
-    add("127.0.0.1")
-    try:
-        _hn, _aliaslist, ipaddrs = socket.gethostbyname_ex(socket.gethostname())
-        for ip in ipaddrs:
-            if ip.startswith("127."):
-                continue
-            add(ip)
-    except OSError:
-        pass
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.settimeout(0.2)
-            s.connect(("8.8.8.8", 80))
-            add(s.getsockname()[0])
-        finally:
-            s.close()
-    except OSError:
-        pass
-    return out
+    return ["127.0.0.1", *discover_lan_hosts()] if lan_access else ["127.0.0.1"]
 
 
 def tcp_port_is_available(host: str, port: int) -> bool:
     """Return True if we can bind to ``host:port`` (nothing listening yet)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    clean_host = host.strip("[]")
+    family = socket.AF_INET6 if ":" in clean_host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
         try:
-            s.bind((host, port))
+            s.bind((clean_host, port))
         except OSError:
             return False
         return True
+
+
+def wait_for_tcp_listener(host: str, port: int, *, timeout: float = 5.0) -> bool:
+    """Wait until a TCP listener accepts connections instead of guessing with a fixed sleep."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    clean_host = host.strip("[]")
+    while True:
+        try:
+            with socket.create_connection((clean_host, port), timeout=0.2):
+                return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
 
 def write_minimal_mediamtx_config(
@@ -72,13 +97,16 @@ def write_minimal_mediamtx_config(
     rtsp_path: str,
     listen_port: int,
     *,
+    lan_access: bool = False,
+    listen_host: str = "127.0.0.1",
     webrtc_enabled: bool = False,
     webrtc_http_port: int = 8889,
 ) -> None:
     """Write a minimal MediaMTX config: RTSP publisher path and optional WebRTC (browser) playback."""
     if webrtc_enabled:
-        hosts = discover_webrtc_additional_hosts()
+        hosts = discover_webrtc_additional_hosts(lan_access=lan_access)
         hosts_yaml = ", ".join(hosts)
+        webrtc_host = "" if lan_access else _local_bind_host(listen_host)
         # - webrtcIPsFromInterfaces: false — on Windows, auto-discovered IPs often include VPN /
         #   virtual adapters; the browser then negotiates ICE candidates that never reach 127.0.0.1.
         # - webrtcICEServers2: [] — STUN is for NAT hole-punching; for same-machine / LAN it can
@@ -86,26 +114,43 @@ def write_minimal_mediamtx_config(
         #   + host candidates in webrtcAdditionalHosts is enough for typical local playback.
         webrtc_block = f"""
 webrtc: true
-webrtcAddress: :{webrtc_http_port}
+webrtcAddress: {_listener_address(webrtc_host, webrtc_http_port)}
 webrtcIPsFromInterfaces: false
-webrtcLocalUDPAddress: :8189
-webrtcLocalTCPAddress: :8189
+webrtcLocalUDPAddress: {_listener_address(webrtc_host, 8189)}
+webrtcLocalTCPAddress: {_listener_address(webrtc_host, 8189)}
 webrtcAdditionalHosts: [{hosts_yaml}]
 webrtcICEServers2: []
 """
     else:
         webrtc_block = "\nwebrtc: false\n"
 
+    path_key = json.dumps(rtsp_path)
+    rtsp_host = "" if lan_access else _local_bind_host(listen_host)
     content = f"""# Generated by easy-rtsp
 logLevel: warn
 logDestinations: [stdout]
-rtspAddress: :{listen_port}
+rtspAddress: {_listener_address(rtsp_host, listen_port)}
+rtspTransports: [tcp]
+rtmp: false
+hls: false
+srt: false
 {webrtc_block}
 paths:
-  {rtsp_path}:
+  {path_key}:
     source: publisher
 """
     path.write_text(content, encoding="utf-8")
+
+
+def _local_bind_host(host: str) -> str:
+    clean = host.strip().strip("[]")
+    return "127.0.0.1" if clean.lower().rstrip(".") == "localhost" else clean
+
+
+def _listener_address(host: str, port: int) -> str:
+    if not host:
+        return f":{port}"
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 class MediaMTXProcess:
@@ -157,15 +202,17 @@ class MediaMTXProcess:
             proc = subprocess.Popen(
                 [binary, str(config_path)],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-        except FileNotFoundError as e:
-            raise DependencyError("mediamtx could not be executed.") from e
-        assert proc.stderr is not None
+        except OSError as e:
+            with suppress(OSError):
+                config_path.unlink()
+            raise DependencyError(f"mediamtx could not be executed: {e}") from e
+        assert proc.stdout is not None
         stderr_tail, stderr_thread = start_tail_reader(
-            proc.stderr,
-            name="easy-rtsp-mediamtx-stderr",
+            proc.stdout,
+            name="easy-rtsp-mediamtx-output",
         )
         time.sleep(0.15)
         if proc.poll() is not None:
