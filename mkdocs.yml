@@ -86,6 +86,11 @@ nav:
   - Guides:
       - Relay and transform: guides/relay-transform.md
       - Recording and HLS: guides/recording-hls.md
+  - Integrations:
+      - Edge CV overview: integrations/index.md
+      - GStreamer: integrations/gstreamer.md
+      - NVIDIA DeepStream: integrations/deepstream.md
+      - NVIDIA Triton: integrations/triton.md
   - Reference:
       - Python API: reference/python-api.md
       - Configuration: reference/configuration.md

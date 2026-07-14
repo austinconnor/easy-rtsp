@@ -8,6 +8,8 @@ Python library for ingesting video, transforming frames with NumPy/OpenCV, and r
 
 **[Documentation](https://austinconnor.github.io/easy-rtsp/)** · **[PyPI](https://pypi.org/project/easy-rtsp/)** · **[GitHub Wiki](https://github.com/austinconnor/easy-rtsp/wiki)**
 
+Building an edge computer-vision pipeline? Start with the **[GStreamer, DeepStream, and Triton integration guide](https://austinconnor.github.io/easy-rtsp/integrations/)**.
+
 **Status:** early development. See `ROADMAP.md` for scope and roadmap.
 
 ## Install

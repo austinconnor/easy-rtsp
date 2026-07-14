@@ -12,6 +12,7 @@ Ingest RTSP, webcams, files, or generated frames. Transform them in Python. Publ
 
 <div class="ertsp-actions" markdown>
 [Get started](getting-started.md){ .md-button .md-button--primary }
+[Edge CV integrations](integrations/index.md){ .md-button }
 [View on GitHub](https://github.com/austinconnor/easy-rtsp){ .md-button }
 </div>
 
@@ -40,6 +41,11 @@ Chain frame callbacks with `map()`. Return a BGR `uint8` frame or `None` to drop
 <div class="ertsp-card" markdown>
 ### Publish everywhere
 Serve RTSP locally, expose it explicitly to your LAN, relay to another server, or publish SRT.
+</div>
+
+<div class="ertsp-card" markdown>
+### Connect edge CV
+Hand streams to GStreamer or DeepStream, or call Triton from a Python frame processor.
 </div>
 
 </div>
