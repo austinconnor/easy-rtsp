@@ -22,6 +22,7 @@ def setup_cli_logging(verbose: bool = False) -> None:
     h = logging.StreamHandler(sys.stderr)
     h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     _LOG.addHandler(h)
+    _LOG.propagate = False
     _LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
@@ -47,7 +48,8 @@ def configure_logging(level: int = logging.INFO) -> None:
     if not root.handlers:
         logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     _LOG.setLevel(level)
-    if not _LOG.handlers:
+    real_handlers = [h for h in _LOG.handlers if not isinstance(h, logging.NullHandler)]
+    if not real_handlers and not root.handlers:
         h = logging.StreamHandler(sys.stderr)
         h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
         _LOG.addHandler(h)

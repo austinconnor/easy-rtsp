@@ -17,9 +17,9 @@ from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
 from easy_rtsp.serve_url import redact_url_credentials
 
 
-def _install_sigint_stop(stream: object):
+def _install_sigint_stop(stream: object, interrupted: list[bool] | None = None):
     """
-    Call :meth:`~easy_rtsp.stream.Stream.stop` on SIGINT so Ctrl+C works even when
+    Signal :meth:`~easy_rtsp.stream.Stream.wait` on SIGINT so Ctrl+C works even when
     ``KeyboardInterrupt`` is not delivered (common on Windows consoles).
 
     Returns the previous SIGINT handler to restore in ``finally``, or ``None`` if unchanged.
@@ -28,10 +28,18 @@ def _install_sigint_stop(stream: object):
         return None
 
     def _handler(_signum: int, _frame: object) -> None:
-        try:
-            stream.stop()
-        except Exception:
-            pass
+        if interrupted is not None:
+            interrupted[0] = True
+        stop_ev = getattr(stream, "_stop_event", None)
+        wait_ev = getattr(stream, "_wait_event", None)
+        if stop_ev is not None and wait_ev is not None:
+            stop_ev.set()
+            wait_ev.set()
+        else:
+            try:
+                stream.stop()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     return signal.signal(signal.SIGINT, _handler)
 
@@ -41,10 +49,11 @@ def _print_play_url(stream: object) -> None:
     viewer_url = getattr(stream, "viewer_url", None)
     if not viewer_url:
         return
+    safe_viewer_url = redact_url_credentials(str(viewer_url))
     if str(viewer_url).startswith(("rtsp://", "rtsps://")):
-        print(f"Play: {viewer_url}", flush=True)
+        print(f"Play: {safe_viewer_url}", flush=True)
     else:
-        print(f"Play (TCP/MPEG-TS): {viewer_url}", flush=True)
+        print(f"Play (TCP/MPEG-TS): {safe_viewer_url}", flush=True)
     webrtc = getattr(stream, "webrtc_play_url", None)
     if webrtc:
         print(f"WebRTC: {webrtc}", flush=True)
@@ -62,10 +71,12 @@ def _print_play_url(stream: object) -> None:
             flush=True,
         )
         if getattr(stream, "lan_webrtc_play_urls", ()):
-            webrtc_port = getattr(getattr(stream, "config", None), "webrtc_http_port", 8889)
+            cfg = getattr(stream, "config", None)
+            webrtc_port = getattr(cfg, "webrtc_http_port", 8889)
+            ice_port = getattr(cfg, "webrtc_ice_port", 8189)
             print(
                 "  If WebRTC stays on loading: disable VPN for a test, try another browser, "
-                f"and allow TCP {webrtc_port} plus UDP/TCP 8189 for MediaMTX.",
+                f"and allow TCP {webrtc_port} plus UDP/TCP {ice_port} for MediaMTX.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -74,16 +85,19 @@ def _print_play_url(stream: object) -> None:
 def _wait_for_stream(stream: object) -> int:
     """Print playback details, wait for shutdown, and surface background failures."""
     _print_play_url(stream)
-    prev = _install_sigint_stop(stream)
+    interrupted = [False]
+    prev = _install_sigint_stop(stream, interrupted)
     try:
-        stream.wait()
+        stream.wait()  # type: ignore[attr-defined]
     except KeyboardInterrupt:
-        stream.stop()
+        interrupted[0] = True
     finally:
         if prev is not None:
             signal.signal(signal.SIGINT, prev)
+        if interrupted[0]:
+            stream.stop()  # type: ignore[attr-defined]
 
-    status = stream.status()
+    status = stream.status()  # type: ignore[attr-defined]
     if status.has_publish_error:
         print(f"error: {status.publish_error or 'publishing failed'}", file=sys.stderr, flush=True)
         return 1
@@ -151,6 +165,8 @@ def _config_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         server_port=args.server_port,
         lan_access=bool(getattr(args, "lan", False)),
     )
+    if getattr(args, "latency_ms", None) is not None:
+        d["latency_ms"] = int(args.latency_ms)
     if getattr(args, "low_latency_input", False):
         d["input_realtime_pace"] = False
     if getattr(args, "record", None):
@@ -159,14 +175,22 @@ def _config_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         d["hls_output_dir"] = args.hls_dir
     if getattr(args, "hls_segment_time", None) is not None:
         d["hls_segment_time"] = float(args.hls_segment_time)
+    if getattr(args, "hls_list_size", None) is not None:
+        d["hls_list_size"] = int(args.hls_list_size)
     if getattr(args, "video_encoder", None):
         d["video_encoder"] = args.video_encoder
+    if getattr(args, "bitrate", None):
+        d["bitrate"] = args.bitrate
+    if getattr(args, "preset", None):
+        d["preset"] = args.preset
     if getattr(args, "audio_mode", None) is not None:
         d["audio_mode"] = args.audio_mode
     if getattr(args, "webrtc_enabled", None) is not None:
         d["webrtc_enabled"] = bool(args.webrtc_enabled)
     if getattr(args, "webrtc_port", None) is not None:
         d["webrtc_http_port"] = int(args.webrtc_port)
+    if getattr(args, "webrtc_ice_port", None) is not None:
+        d["webrtc_ice_port"] = int(args.webrtc_ice_port)
     if getattr(args, "fps", None) is not None:
         d["fps"] = float(args.fps)
     if getattr(args, "file_loop", None) is not None:
@@ -194,7 +218,8 @@ def cmd_webcam(args: argparse.Namespace) -> int:
     from easy_rtsp import Stream
 
     print(
-        f"easy-rtsp: webcam index {args.index} -> --serve {args.serve!r} (Ctrl+C to stop)",
+        f"easy-rtsp: webcam index {args.index} "
+        f"-> --serve {redact_url_credentials(args.serve)!r} (Ctrl+C to stop)",
         file=sys.stderr,
         flush=True,
     )
@@ -215,7 +240,8 @@ def cmd_file(args: argparse.Namespace) -> int:
         print(f"error: not a file: {path}", file=sys.stderr)
         return 2
     print(
-        f"easy-rtsp: file {path} -> --serve {args.serve!r} (Ctrl+C to stop)",
+        f"easy-rtsp: file {path} "
+        f"-> --serve {redact_url_credentials(args.serve)!r} (Ctrl+C to stop)",
         file=sys.stderr,
         flush=True,
     )
@@ -286,6 +312,20 @@ def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="Also write HLS (index.m3u8 + segments) under DIR (RTSP push only)",
     )
     p.add_argument(
+        "--latency-ms",
+        type=int,
+        default=StreamConfig.latency_ms,
+        metavar="MS",
+        help="Optional RTSP ingest latency hint in milliseconds (relay only)",
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        metavar="FPS",
+        help="Publish frame rate override (default: probed or 30)",
+    )
+    p.add_argument(
         "--hls-segment-time",
         type=float,
         default=StreamConfig.hls_segment_time,
@@ -293,10 +333,29 @@ def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="HLS segment duration (default: %(default)s)",
     )
     p.add_argument(
+        "--hls-list-size",
+        type=int,
+        default=StreamConfig.hls_list_size,
+        metavar="N",
+        help="HLS playlist segment count to retain (default: %(default)s; 0 keeps all)",
+    )
+    p.add_argument(
         "--video-encoder",
         metavar="NAME",
         default=None,
         help="FFmpeg video encoder (e.g. h264_nvenc, h264_qsv); default is libx264 for H.264",
+    )
+    p.add_argument(
+        "--bitrate",
+        metavar="RATE",
+        default=None,
+        help='Optional video encoder bitrate (e.g. "4M")',
+    )
+    p.add_argument(
+        "--preset",
+        choices=["default", "low_latency", "quality"],
+        default=StreamConfig.preset,
+        help="Encoding quality/latency preset (default: %(default)s)",
     )
     p.add_argument(
         "--lan",
@@ -322,6 +381,13 @@ def _add_serve_arguments(p: argparse.ArgumentParser) -> None:
         default=StreamConfig.webrtc_http_port,
         metavar="PORT",
         help="MediaMTX WebRTC HTTP port (default: %(default)s)",
+    )
+    p.add_argument(
+        "--webrtc-ice-port",
+        type=int,
+        default=StreamConfig.webrtc_ice_port,
+        metavar="PORT",
+        help="MediaMTX WebRTC UDP/TCP ICE port (default: %(default)s)",
     )
     p.add_argument(
         "-v",
@@ -399,13 +465,6 @@ def main(argv: list[str] | None = None) -> int:
         description="Example: easy-rtsp file input.mp4 --serve demo",
     )
     p_file.add_argument("path", help="Path to a video file")
-    p_file.add_argument(
-        "--fps",
-        type=float,
-        default=None,
-        metavar="FPS",
-        help="Publish frame rate (default: from file metadata via ffprobe, else 30)",
-    )
     p_file.add_argument(
         "--loop",
         action=argparse.BooleanOptionalAction,

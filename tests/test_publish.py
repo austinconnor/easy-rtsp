@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from easy_rtsp.config import StreamConfig
@@ -302,3 +304,90 @@ def test_publish_failure_includes_ffmpeg_diagnostics() -> None:
                 config=StreamConfig(),
                 rtsp_push_url="rtsp://127.0.0.1:9/x",
             )
+
+
+def test_publish_broken_pipe_after_first_frame_raises_publish_error() -> None:
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    with (
+        patch("easy_rtsp.publish.subprocess.Popen") as p,
+        patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
+    ):
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write.side_effect = [None, BrokenPipeError("broken pipe")]
+        mock_proc.stderr = BytesIO(
+            b"rtsp://user:secret@127.0.0.1:8554/live: 401 Unauthorized"
+        )
+        mock_proc.poll.return_value = 1
+        mock_proc.wait.return_value = 1
+        p.return_value = mock_proc
+
+        with pytest.raises(PublishError) as exc:
+            run_publish_loop(
+                iter([frame, frame]),
+                width=64,
+                height=48,
+                fps=10.0,
+                config=StreamConfig(),
+                rtsp_push_url="rtsp://user:secret@127.0.0.1:8554/live",
+            )
+
+    assert "401 Unauthorized" in str(exc.value)
+    assert "secret" not in str(exc.value)
+    assert "user:***@127.0.0.1" in str(exc.value)
+
+
+def test_publish_broken_pipe_ignored_when_stop_event_is_set() -> None:
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    stop_event = threading.Event()
+    with (
+        patch("easy_rtsp.publish.subprocess.Popen") as p,
+        patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
+    ):
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+
+        def write_and_stop(_data: bytes) -> None:
+            stop_event.set()
+            raise BrokenPipeError("stopped")
+
+        mock_proc.stdin.write.side_effect = write_and_stop
+        mock_proc.stderr = BytesIO(b"Exiting")
+        mock_proc.poll.return_value = 1
+        mock_proc.wait.return_value = 1
+        p.return_value = mock_proc
+
+        run_publish_loop(
+            iter([frame]),
+            width=64,
+            height=48,
+            fps=10.0,
+            config=StreamConfig(),
+            stop_event=stop_event,
+            rtsp_push_url="rtsp://127.0.0.1:8554/live",
+        )
+
+
+def test_run_publish_loop_adapts_to_resized_first_frame() -> None:
+    resized = np.zeros((24, 32, 3), dtype=np.uint8)
+    with (
+        patch("easy_rtsp.publish.subprocess.Popen") as p,
+        patch("easy_rtsp.publish.resolve_ffmpeg", return_value="/bin/ffmpeg"),
+    ):
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = BytesIO(b"")
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+        p.return_value = mock_proc
+
+        run_publish_loop(
+            iter([resized]),
+            width=64,
+            height=48,
+            fps=10.0,
+            config=StreamConfig(),
+            rtsp_push_url="rtsp://127.0.0.1:8554/live",
+        )
+        args = p.call_args[0][0]
+        assert args[args.index("-s") + 1] == "32x24"

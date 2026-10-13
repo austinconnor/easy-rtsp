@@ -40,6 +40,10 @@ def probe_webcam_dimensions(index: int, *, timeout_sec: float = _DEFAULT_PROBE_T
             try:
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if w <= 0 or h <= 0:
+                    ok, sample = cap.read()
+                    if ok and sample is not None and getattr(sample, "ndim", 0) >= 2:
+                        h, w = int(sample.shape[0]), int(sample.shape[1])
                 result.append((max(w, 1), max(h, 1)))
             finally:
                 cap.release()
@@ -67,6 +71,7 @@ class WebcamSource:
     def __init__(self, index: int = 0, config: StreamConfig | None = None) -> None:
         self._index = index
         self._config = config or StreamConfig()
+        self._stop_event: threading.Event | None = None
 
     @property
     def config(self) -> StreamConfig:
@@ -86,6 +91,8 @@ class WebcamSource:
             raise SourceError(f"Could not open webcam index {self._index}")
         try:
             while True:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break

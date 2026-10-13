@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from ipaddress import ip_address
 from urllib.parse import quote, urlparse, urlunparse
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import ConfigurationError
+
+_CREDENTIAL_URL_RE = re.compile(
+    r"((?:rtsp|rtsps|srt)://[^/\s:@]+:)([^@\s/]+)(@)",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -51,8 +57,11 @@ def build_rtsp_url(
     if not path:
         path = "live"
     scheme = "rtsps" if secure else "rtsp"
-    path_clean = path if path.startswith("/") else f"/{path.lstrip('/')}"
-    path_clean = quote(path_clean, safe="/")
+    path_part, _sep, query_part = path.partition("?")
+    path_clean = path_part if path_part.startswith("/") else f"/{path_part.lstrip('/')}"
+    if not path_clean or path_clean == "/":
+        path_clean = "/live"
+    path_clean = quote(path_clean, safe="/%")
     userinfo = ""
     if username is not None:
         userinfo = quote(username, safe="")
@@ -60,7 +69,7 @@ def build_rtsp_url(
             userinfo += f":{quote(password, safe='')}"
         userinfo += "@"
     netloc = f"{userinfo}{_format_url_host(host)}:{port}"
-    return urlunparse((scheme, netloc, path_clean, "", "", ""))
+    return urlunparse((scheme, netloc, path_clean, "", query_part, ""))
 
 
 def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestination:
@@ -76,13 +85,16 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         raise ConfigurationError("serve() endpoint must be non-empty")
 
     if "://" not in raw:
-        path = raw.lstrip("/")
+        path_part, _sep, query_part = raw.partition("?")
+        path = path_part.lstrip("/")
         if not path:
             path = "live"
         host = config.server_host
         port = _validate_port(config.server_port, context="server_port")
         path = quote(path, safe="/%")
         url = f"rtsp://{_format_url_host(host)}:{port}/{path}"
+        if query_part:
+            url = f"{url}?{query_part}"
         return PublishDestination(url=url, host=host, port=port, path_name=path, scheme="rtsp")
 
     try:
@@ -91,7 +103,7 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         raise ConfigurationError(f"Invalid publish URL: {redact_url_credentials(raw)!r}") from e
     scheme = (u.scheme or "").lower()
     if scheme in ("rtsp", "rtsps"):
-        host = u.hostname or config.server_host
+        host = u.hostname
         if not host:
             raise ConfigurationError("RTSP URL must include a host or use a shorthand like 'live'")
         try:
@@ -156,13 +168,18 @@ def redact_url_credentials(value: str) -> str:
     try:
         parsed = urlparse(value)
     except ValueError:
-        return value
+        return redact_credentials_in_text(value)
     userinfo, separator, hostinfo = parsed.netloc.rpartition("@")
     if not separator or ":" not in userinfo:
-        return value
+        return redact_credentials_in_text(value)
     username, _password = userinfo.split(":", 1)
     safe_netloc = f"{username}:***@{hostinfo}"
     return urlunparse(parsed._replace(netloc=safe_netloc))
+
+
+def redact_credentials_in_text(text: str) -> str:
+    """Redact credentials embedded in any RTSP/RTSPS/SRT URLs inside free-form error text."""
+    return _CREDENTIAL_URL_RE.sub(r"\1***\3", text)
 
 
 def format_url_host(host: str) -> str:

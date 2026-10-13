@@ -40,7 +40,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/easy-rtsp/easy-rtsp"
+Homepage = "https://github.com/austinconnor/easy-rtsp"
+Documentation = "https://austinconnor.github.io/easy-rtsp/"
+Repository = "https://github.com/austinconnor/easy-rtsp"
 
 [project.scripts]
 easy-rtsp = "easy_rtsp.cli:main"

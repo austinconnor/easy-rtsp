@@ -86,6 +86,15 @@ def test_unknown_architecture_is_not_mistaken_for_amd64() -> None:
             _platform_asset_suffix()
 
 
+def test_windows_arm64_selects_windows_amd64_zip() -> None:
+    from easy_rtsp.install_backends import _platform_asset_suffix
+
+    with patch("platform.system", return_value="Windows"), patch(
+        "platform.machine", return_value="ARM64"
+    ):
+        assert _platform_asset_suffix() == "windows_amd64.zip"
+
+
 class _FakeResp:
     def __init__(self, data: bytes) -> None:
         self._bio = BytesIO(data)

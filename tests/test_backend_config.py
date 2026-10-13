@@ -7,6 +7,7 @@ from pathlib import Path
 
 from easy_rtsp.backend import (
     discover_lan_hosts,
+    tcp_port_is_available,
     wait_for_tcp_listener,
     write_minimal_mediamtx_config,
 )
@@ -97,3 +98,30 @@ def test_wait_for_tcp_listener_checks_real_readiness() -> None:
         assert wait_for_tcp_listener("127.0.0.1", port, timeout=0.1)
 
     assert not wait_for_tcp_listener("127.0.0.1", port, timeout=0.0)
+
+
+def test_tcp_port_is_available_detects_wildcard_listener() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("0.0.0.0", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        assert not tcp_port_is_available("127.0.0.1", port)
+
+
+def test_mediamtx_config_quotes_ipv6_and_uses_custom_ice_port(tmp_path: Path) -> None:
+    p = tmp_path / "mtx_ipv6.yml"
+    write_minimal_mediamtx_config(
+        p,
+        "live",
+        8554,
+        listen_host="::1",
+        webrtc_enabled=True,
+        webrtc_http_port=8889,
+        webrtc_ice_port=8190,
+    )
+    text = p.read_text(encoding="utf-8")
+    assert 'rtspAddress: "[::1]:8554"' in text
+    assert 'webrtcAddress: "[::1]:8889"' in text
+    assert 'webrtcLocalUDPAddress: "[::1]:8190"' in text
+    assert 'webrtcLocalTCPAddress: "[::1]:8190"' in text
+    assert '"::1"' in text

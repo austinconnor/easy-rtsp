@@ -19,6 +19,7 @@ from easy_rtsp.exceptions import (
 # ``import easy_rtsp.install_backends`` and lightweight tests stay fast.
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "Stream": ("easy_rtsp.stream", "Stream"),
+    "StreamConfig": ("easy_rtsp.config", "StreamConfig"),
     "StreamState": ("easy_rtsp.types", "StreamState"),
     "StreamStatus": ("easy_rtsp.types", "StreamStatus"),
     "PublishDestination": ("easy_rtsp.serve_url", "PublishDestination"),
@@ -43,6 +44,7 @@ __all__ = [
     "parse_publish_destination",
     "SourceError",
     "Stream",
+    "StreamConfig",
     "StreamState",
     "StreamStatus",
 ]
@@ -70,6 +72,7 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:
+    from easy_rtsp.config import StreamConfig
     from easy_rtsp.log import configure_logging, get_logger, setup_cli_logging
     from easy_rtsp.serve_url import PublishDestination, build_rtsp_url, parse_publish_destination
     from easy_rtsp.stream import Stream

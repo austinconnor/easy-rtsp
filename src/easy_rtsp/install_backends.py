@@ -65,7 +65,7 @@ def _platform_asset_suffix() -> str:
             raise DependencyError(f"Unsupported macOS architecture: {machine}")
         return f"darwin_{arch}.tar.gz"
     if system == "Windows":
-        if machine in amd64:
+        if machine in amd64 or machine in arm64:
             return "windows_amd64.zip"
         raise DependencyError(f"Unsupported Windows architecture: {machine}")
     raise DependencyError(f"Unsupported platform for bundled MediaMTX download: {system} {machine}")

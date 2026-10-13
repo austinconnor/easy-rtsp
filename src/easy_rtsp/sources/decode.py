@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from collections.abc import Iterator
 from typing import Callable
 
@@ -11,6 +12,7 @@ import numpy as np
 from easy_rtsp.exceptions import DependencyError, SourceError
 from easy_rtsp.ffmpeg_util import resolve_ffmpeg
 from easy_rtsp.process_io import decode_tail_bytes, discard_process, start_tail_reader
+from easy_rtsp.serve_url import redact_credentials_in_text
 
 
 def _ffmpeg_exit_ok(returncode: int | None, stderr: str) -> bool:
@@ -33,8 +35,9 @@ def iter_raw_bgr_frames(
     *,
     stderr_filter: Callable[[str], None] | None = None,
     proc_holder: list[subprocess.Popen[bytes]] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> Iterator[np.ndarray]:
-    """Run FFmpeg and yield BGR frames read from stdout."""
+    """Run FFmpeg and yield writeable BGR frames read from stdout."""
     if width <= 0 or height <= 0:
         raise SourceError("width and height must be positive")
     ffmpeg = resolve_ffmpeg()
@@ -61,12 +64,14 @@ def iter_raw_bgr_frames(
     frame_bytes = width * height * 3
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
             buf = proc.stdout.read(frame_bytes)
             if not buf or len(buf) < frame_bytes:
                 break
-            yield np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3))
+            yield np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3)).copy()
     finally:
-        killed_by_us = False
+        killed_by_us = bool(stop_event is not None and stop_event.is_set())
         try:
             proc.stdout.close()
         except OSError:
@@ -82,7 +87,7 @@ def iter_raw_bgr_frames(
             killed_by_us = True
         stderr_thread.join(timeout=5.0)
         discard_process(proc_holder, proc)
-        err = decode_tail_bytes(stderr_tail)
+        err = redact_credentials_in_text(decode_tail_bytes(stderr_tail))
         if not killed_by_us and not _ffmpeg_exit_ok(proc.returncode, err):
             if stderr_filter:
                 stderr_filter(err)

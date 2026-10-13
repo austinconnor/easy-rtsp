@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import numpy as np
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import SourceError
-from easy_rtsp.ffmpeg_util import probe_video
+from easy_rtsp.ffmpeg_util import VideoProbe, probe_video
 from easy_rtsp.sources.base import ensure_bgr_uint8
 from easy_rtsp.sources.decode import iter_raw_bgr_frames
 
@@ -22,6 +23,8 @@ class FileSource:
         if not self._path.is_file():
             raise SourceError(f"Not a file or missing: {self._path}")
         self._config = config or StreamConfig()
+        self._cached_probe: VideoProbe | None = None
+        self._stop_event: threading.Event | None = None
 
     @property
     def config(self) -> StreamConfig:
@@ -29,7 +32,11 @@ class FileSource:
 
     def frames(self) -> Iterator[np.ndarray]:
         path_str = str(self._path.resolve())
-        probe = probe_video(path_str)
+        if self._cached_probe is not None:
+            probe = self._cached_probe
+            self._cached_probe = None
+        else:
+            probe = probe_video(path_str)
         w, h = probe.width, probe.height
 
         # Loop inside FFmpeg (-stream_loop -1) so one decode process runs continuously; restarting
@@ -37,6 +44,12 @@ class FileSource:
         loop = ["-stream_loop", "-1"] if self._config.file_loop else []
         input_args = self._config.extra_ffmpeg_input_args + loop + ["-i", path_str, "-an"]
         for frame in iter_raw_bgr_frames(
-            input_args, w, h, proc_holder=self._config.ffmpeg_children
+            input_args,
+            w,
+            h,
+            proc_holder=self._config.ffmpeg_children,
+            stop_event=self._stop_event,
         ):
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
             yield ensure_bgr_uint8(frame, context="FileSource")

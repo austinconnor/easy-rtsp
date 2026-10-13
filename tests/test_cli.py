@@ -74,3 +74,18 @@ def test_file_missing_path_errors(capsys: pytest.CaptureFixture[str]) -> None:
     assert code == 2
     err = capsys.readouterr().err
     assert "not a file" in err
+
+
+def test_print_play_url_redacts_publish_credentials(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = SimpleNamespace(
+        viewer_url="rtsp://publisher:topsecret@192.168.1.50:8554/live",
+        webrtc_play_url=None,
+        lan_viewer_urls=(),
+        lan_webrtc_play_urls=(),
+    )
+    _print_play_url(stream)
+    captured = capsys.readouterr()
+    assert "topsecret" not in captured.out
+    assert "Play: rtsp://publisher:***@192.168.1.50:8554/live" in captured.out

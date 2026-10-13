@@ -87,17 +87,36 @@ class StreamConfig:
     hls_segment_time: float = 2.0
     """HLS segment duration in seconds when ``hls_output_dir`` is set."""
 
+    hls_list_size: int = 5
+    """Maximum number of HLS playlist entries to keep before old segments are deleted (``0`` keeps all segments)."""
+
     webrtc_enabled: bool = False
     """When easy-rtsp starts MediaMTX locally, enable its WebRTC HTTP server (default off; RTSP remains available)."""
 
     webrtc_http_port: int = 8889
     """Port for MediaMTX WebRTC signaling HTTP listener (``webrtcAddress``)."""
 
+    webrtc_ice_port: int = 8189
+    """Port for MediaMTX WebRTC local UDP/TCP ICE candidates (``webrtcLocalUDPAddress`` / ``webrtcLocalTCPAddress``)."""
+
     on_reconnecting: Callable[[int], None] | None = None
     """Optional callback ``(attempt_number)`` before each RTSP reconnect (after the first session ends)."""
 
-    ffmpeg_children: list[Any] = field(default_factory=list, repr=False)
+    ffmpeg_children: list[Any] = field(default_factory=list, repr=False, compare=False)
     """Internal: FFmpeg subprocesses (decode + encode) to terminate on :meth:`~easy_rtsp.stream.Stream.stop`."""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> StreamConfig:
+        import copy
+
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            if k == "ffmpeg_children":
+                setattr(result, k, [])
+            else:
+                setattr(result, k, copy.deepcopy(v, memo))
+        return result
 
     def __post_init__(self) -> None:
         """Reject invalid values before they become obscure FFmpeg or socket errors."""
@@ -145,10 +164,17 @@ class StreamConfig:
             raise ConfigurationError("lan_access must be a boolean")
         _validate_port("server_port", self.server_port)
         _validate_port("webrtc_http_port", self.webrtc_http_port)
+        _validate_port("webrtc_ice_port", self.webrtc_ice_port)
         if self.fps is not None and not _is_positive_number(self.fps):
             raise ConfigurationError("fps must be positive")
         if not _is_positive_number(self.hls_segment_time):
             raise ConfigurationError("hls_segment_time must be positive")
+        if (
+            not isinstance(self.hls_list_size, int)
+            or isinstance(self.hls_list_size, bool)
+            or self.hls_list_size < 0
+        ):
+            raise ConfigurationError("hls_list_size must be zero or positive")
 
 
 def _validate_port(name: str, value: int) -> None:

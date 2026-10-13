@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-from easy_rtsp import ConfigurationError, ProcessingError, PublishError, Stream
+from easy_rtsp import ConfigurationError, ProcessingError, PublishError, Stream, StreamConfig
+from easy_rtsp.ffmpeg_util import VideoProbe
 from easy_rtsp.types import StreamState
 
 
@@ -386,3 +388,48 @@ def test_save_snapshot_requires_frame() -> None:
     s = Stream.from_frames(iter(()), fps=30.0, size=(4, 4))
     with pytest.raises(ProcessingError, match="No frame available yet"):
         s.save_snapshot(Path("snapshot.png"))
+
+
+def test_chained_map_calls_on_reconnecting_once_per_attempt() -> None:
+    attempts: list[int] = []
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    with (
+        patch(
+            "easy_rtsp.sources.rtsp.probe_video",
+            side_effect=[OSError("down"), VideoProbe(4, 4, 30.0)],
+        ),
+        patch("easy_rtsp.sources.rtsp.iter_raw_bgr_frames", return_value=iter([frame])),
+    ):
+        stream = (
+            Stream.open(
+                "rtsp://camera/live",
+                reconnect=True,
+                max_reconnect_attempts=1,
+                retry_interval_sec=0.0,
+                on_reconnecting=attempts.append,
+            )
+            .map(lambda f: f)
+            .map(lambda f: f)
+        )
+        out = list(stream.frames())
+
+    assert len(out) == 1
+    assert attempts == [1]
+    assert stream.reconnect_count == 1
+
+
+def test_rtsp_explicit_fps_overrides_probed_fps() -> None:
+    with patch("easy_rtsp.stream.probe_video", return_value=VideoProbe(640, 480, 30.0)):
+        stream = Stream.open("rtsp://camera/live", fps=15.0)
+        w, h, fps = stream._infer_publish_params()
+    assert (w, h) == (640, 480)
+    assert fps == 15.0
+
+
+def test_stream_config_deepcopy_drops_active_popen_handles() -> None:
+    cfg = StreamConfig(bitrate="2M")
+    cfg.ffmpeg_children.append(object())
+    cloned = copy.deepcopy(cfg)
+    assert cloned.bitrate == "2M"
+    assert cloned.ffmpeg_children == []

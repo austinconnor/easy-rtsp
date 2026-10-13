@@ -9,6 +9,7 @@ from easy_rtsp.serve_url import (
     is_loopback_host,
     parse_publish_destination,
     parse_serve_endpoint,
+    redact_credentials_in_text,
     redact_url_credentials,
 )
 
@@ -131,3 +132,25 @@ def test_loopback() -> None:
     assert is_loopback_host("127.0.0.2")
     assert is_loopback_host("localhost")
     assert not is_loopback_host("192.168.0.1")
+
+
+def test_build_rtsp_url_preserves_query_parameters() -> None:
+    url = build_rtsp_url(
+        "192.168.1.10",
+        "cam/realmonitor?channel=1&subtype=0",
+        username="admin",
+        password="secret",
+    )
+    assert url == "rtsp://admin:secret@192.168.1.10:8554/cam/realmonitor?channel=1&subtype=0"
+
+
+def test_rtsp_url_requires_hostname_even_with_userinfo() -> None:
+    with pytest.raises(ConfigurationError, match="must include a host"):
+        parse_publish_destination("rtsp://user:pass@/live", StreamConfig())
+
+
+def test_redact_credentials_in_freeform_text() -> None:
+    msg = "Failed to open rtsp://admin:my_secret_pw@10.0.0.5:554/stream1 (401)"
+    redacted = redact_credentials_in_text(msg)
+    assert "my_secret_pw" not in redacted
+    assert "rtsp://admin:***@10.0.0.5:554/stream1" in redacted
