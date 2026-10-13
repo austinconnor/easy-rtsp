@@ -49,6 +49,7 @@ jobs:
       name: pypi
       url: https://pypi.org/project/easy-rtsp/
     permissions:
+      contents: write
       id-token: write
 
     steps:
@@ -62,3 +63,15 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" dist/* \
+              --repo "${{ github.repository }}" \
+              --title "easy-rtsp $TAG" \
+              --generate-notes
+          fi
