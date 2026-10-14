@@ -29,18 +29,22 @@ def test_probe_applies_input_options_before_url() -> None:
 
 def test_probe_timeout_redacts_password() -> None:
     error = subprocess.TimeoutExpired(["ffprobe"], 15)
-    with patch("easy_rtsp.ffmpeg_util.subprocess.check_output", side_effect=error):
-        with pytest.raises(SourceError) as exc:
-            probe_video("rtsp://user:secret@camera/live", ffprobe_bin="ffprobe")
+    with (
+        patch("easy_rtsp.ffmpeg_util.subprocess.check_output", side_effect=error),
+        pytest.raises(SourceError) as exc,
+    ):
+        probe_video("rtsp://user:secret@camera/live", ffprobe_bin="ffprobe")
     assert "secret" not in str(exc.value)
     assert "user:***@camera" in str(exc.value)
 
 
 def test_invalid_executable_override_fails_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EASY_RTSP_FFMPEG", "definitely-not-an-executable")
-    with patch("easy_rtsp.ffmpeg_util._which", return_value=None):
-        with pytest.raises(DependencyError, match="EASY_RTSP_FFMPEG"):
-            resolve_ffmpeg()
+    with (
+        patch("easy_rtsp.ffmpeg_util._which", return_value=None),
+        pytest.raises(DependencyError, match="EASY_RTSP_FFMPEG"),
+    ):
+        resolve_ffmpeg()
 
 
 def test_resolve_mediamtx_checks_default_install_path(

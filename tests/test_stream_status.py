@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from easy_rtsp.exceptions import SourceError
 from easy_rtsp import Stream, StreamStatus
+from easy_rtsp.exceptions import SourceError
 from easy_rtsp.types import StreamState
 
 
@@ -67,6 +67,7 @@ def test_status_tracks_serve_stop_and_thread_liveness() -> None:
         patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
         patch("easy_rtsp.stream.time.sleep"),
     ):
+
         def fake_start_publish_thread(*args: Any, **kwargs: Any) -> _DummyThread:
             kwargs["proc_holder"].extend([alive_child, dead_child])
             return dummy_thread

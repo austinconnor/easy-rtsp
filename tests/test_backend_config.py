@@ -55,9 +55,7 @@ def test_mediamtx_config_is_loopback_only_and_disables_unused_protocols(tmp_path
 
 def test_mediamtx_lan_config_binds_all_interfaces(tmp_path: Path) -> None:
     p = tmp_path / "mtx.yml"
-    write_minimal_mediamtx_config(
-        p, "live", 8554, lan_access=True, webrtc_enabled=True
-    )
+    write_minimal_mediamtx_config(p, "live", 8554, lan_access=True, webrtc_enabled=True)
     text = p.read_text(encoding="utf-8")
     assert "rtspAddress: :8554" in text
     assert "webrtcAddress: :8889" in text

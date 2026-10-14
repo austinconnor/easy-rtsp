@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import time
+from collections.abc import Iterable
 from contextlib import suppress
 from threading import Thread
 from typing import IO, Any
@@ -24,7 +27,7 @@ def start_tail_reader(stream: IO[bytes], *, name: str) -> tuple[bytearray, Threa
                 overflow = len(tail) - _TAIL_MAX_BYTES
                 if overflow > 0:
                     del tail[:overflow]
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
             with suppress(OSError):
@@ -46,3 +49,25 @@ def discard_process(proc_holder: list[Any] | None, proc: Any) -> None:
         return
     with suppress(ValueError):
         proc_holder.remove(proc)
+
+
+def terminate_process(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> None:
+    """Terminate *proc* if it is still running, escalating to ``kill()`` after *timeout*."""
+    terminate_processes([proc], timeout=timeout)
+
+
+def terminate_processes(procs: Iterable[subprocess.Popen[bytes] | None], *, timeout: float) -> None:
+    """Terminate every running process, then kill whichever ones outlive a shared *timeout*."""
+    running = [p for p in procs if p is not None and p.poll() is None]
+    for proc in running:
+        with suppress(OSError):
+            proc.terminate()
+    deadline = time.monotonic() + timeout
+    for proc in running:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                proc.kill()
+            with suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=timeout)

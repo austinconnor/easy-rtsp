@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from easy_rtsp import ConfigurationError, ProcessingError, PublishError, Stream, StreamConfig
+from easy_rtsp import ConfigurationError, ProcessingError, Stream, StreamConfig
 from easy_rtsp.ffmpeg_util import VideoProbe
 from easy_rtsp.types import StreamState
 
@@ -31,12 +31,8 @@ def test_map_chained_applies_outer_then_inner_order() -> None:
     def gen():
         yield np.ones((10, 10, 3), dtype=np.uint8) * 10
 
-    s = (
-        Stream.from_frames(gen, fps=30.0, size=(10, 10))
-        .map(lambda f: f + 1)
-        .map(lambda f: f * 2)
-    )
-    out = list(s.frames())[0]
+    s = Stream.from_frames(gen, fps=30.0, size=(10, 10)).map(lambda f: f + 1).map(lambda f: f * 2)
+    out = next(iter(s.frames()))
     assert out[0, 0, 0] == (10 + 1) * 2
 
 
@@ -67,7 +63,7 @@ def test_map_opencv_draw_rectangle() -> None:
         return out
 
     s = Stream.from_frames(gen, fps=30.0, size=(64, 48)).map(annotate)
-    frame = list(s.frames())[0]
+    frame = next(iter(s.frames()))
     # Border is BGR green (0, 255, 0); interior stays black
     assert frame[5, 5, 1] == 255
     assert np.any(frame[:, :, :] > 0)
@@ -86,7 +82,7 @@ def test_map_numpy_grayscale_blend() -> None:
         return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
     s = Stream.from_frames(gen, fps=30.0, size=(16, 12)).map(to_gray_bgr)
-    out = list(s.frames())[0]
+    out = next(iter(s.frames()))
     assert out.shape == (12, 16, 3)
     # Grayscale converted back to BGR should have near-equal channels
     assert abs(int(out[6, 8, 0]) - int(out[6, 8, 1])) < 5
@@ -143,54 +139,56 @@ def test_side_outputs_fail_early_without_rtsp_server(tmp_path: Path) -> None:
     start_publish.assert_not_called()
 
 
-def test_mediamtx_readiness_failure_cleans_up() -> None:
-    backend = MagicMock()
-    with (
-        patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
-        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
-        patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=backend),
-        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=False),
-        patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
-        pytest.raises(PublishError, match="did not listen"),
-    ):
-        Stream.from_frames(iter(()), fps=30.0, size=(10, 10)).serve("live")
+@pytest.mark.usefixtures("publish_thread")
+def test_failure_after_mediamtx_start_stops_backend(
+    local_mediamtx: MagicMock, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    stream = Stream.from_frames(
+        iter(()), fps=30.0, size=(10, 10), hls_output_dir=str(blocker / "hls")
+    )
 
-    backend.stop.assert_called_once()
+    with pytest.raises(OSError):
+        stream.serve("live")
+
+    local_mediamtx.return_value.stop.assert_called_once()
+    assert stream.state is StreamState.STOPPED
+    assert stream.serve_started is False
 
 
+@pytest.mark.usefixtures("publish_thread", "local_mediamtx")
 def test_serve_twice_raises() -> None:
-    from unittest.mock import MagicMock, patch
-
     def gen():
         yield np.zeros((48, 64, 3), dtype=np.uint8)
 
-    with (
-        patch("easy_rtsp.stream.start_publish_thread"),
-        patch("easy_rtsp.stream.resolve_mediamtx", return_value="/bin/mediamtx"),
-        patch("easy_rtsp.stream.tcp_port_is_available", return_value=True),
-        patch("easy_rtsp.stream.MediaMTXProcess.start", return_value=MagicMock()),
-        patch("easy_rtsp.stream.wait_for_tcp_listener", return_value=True),
-        patch("easy_rtsp.stream.write_minimal_mediamtx_config"),
-        patch("easy_rtsp.stream.tempfile.mkstemp", return_value=(3, "C:\\tmp\\cfg.yml")),
-        patch("easy_rtsp.stream.os.close"),
-        patch("easy_rtsp.stream.time.sleep"),
-    ):
-        s = Stream.from_frames(gen, fps=30.0, size=(64, 48)).serve("live")
-        with pytest.raises(ConfigurationError, match="already started"):
-            s.serve("live")
+    s = Stream.from_frames(gen, fps=30.0, size=(64, 48)).serve("live")
+    with pytest.raises(ConfigurationError, match="already started"):
+        s.serve("live")
+
+
+@pytest.mark.usefixtures("publish_thread", "no_mediamtx")
+def test_serve_twice_does_not_apply_overrides() -> None:
+    s = Stream.from_frames(iter(()), fps=30.0, size=(10, 10)).serve("live")
+    config = s.config
+
+    with pytest.raises(ConfigurationError, match="already started"):
+        s.serve("live", bitrate="9M")
+
+    assert s.config is config
+    assert s.config.bitrate is None
 
 
 def test_open_rtsp_builds_credentials_safely() -> None:
-    with patch("easy_rtsp.stream.RtspSource") as mock_source:
-        Stream.open_rtsp(
-            "camera.example.com",
-            "feed 1",
-            username="user name",
-            password="p@ss:word",
-            port=8554,
-        )
+    stream = Stream.open_rtsp(
+        "camera.example.com",
+        "feed 1",
+        username="user name",
+        password="p@ss:word",
+        port=8554,
+    )
 
-    assert mock_source.call_args[0][0] == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
+    assert stream._source.url == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
 
 
 def test_serve_rtsp_builds_credentials_safely() -> None:
@@ -205,7 +203,10 @@ def test_serve_rtsp_builds_credentials_safely() -> None:
             port=8554,
         )
 
-    assert mock_serve.call_args[0][0] == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
+    assert (
+        mock_serve.call_args[0][0]
+        == "rtsp://user%20name:p%40ss%3Aword@camera.example.com:8554/feed%201"
+    )
 
 
 def test_viewer_url_none_before_serve() -> None:
@@ -354,7 +355,7 @@ def test_audio_passthrough_uses_direct_rtsp_relay_thread() -> None:
 
 def test_audio_passthrough_requires_rtsp_source() -> None:
     stream = Stream.from_frames(iter(()), fps=30.0, size=(4, 4), audio_mode="passthrough")
-    with pytest.raises(ConfigurationError, match="supported only for Stream.open"):
+    with pytest.raises(ConfigurationError, match=r"supported only for Stream\.open"):
         stream.serve("live")
 
 

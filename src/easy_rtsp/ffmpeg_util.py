@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from easy_rtsp.exceptions import DependencyError, SourceError
+from easy_rtsp.install_backends import default_install_prefix
 from easy_rtsp.serve_url import redact_credentials_in_text, redact_url_credentials
 
 _PROBE_TIMEOUT_SEC = 15.0
@@ -56,7 +57,7 @@ def resolve_ffprobe() -> str:
 
 def _default_mediamtx_binary() -> Path:
     exe = "mediamtx.exe" if os.name == "nt" else "mediamtx"
-    return Path.home() / ".easy-rtsp" / "bin" / exe
+    return default_install_prefix() / "bin" / exe
 
 
 def resolve_mediamtx() -> str | None:
@@ -72,6 +73,8 @@ def resolve_mediamtx() -> str | None:
 
 @dataclass(frozen=True)
 class VideoProbe:
+    """Frame size and nominal frame rate (``None`` when unknown) of a video source."""
+
     width: int
     height: int
     fps: float | None
@@ -95,16 +98,17 @@ def _parse_fps(rate: str | None) -> float | None:
         return None
 
 
-def _is_sane_fps(fps: float | None) -> bool:
+def is_sane_fps(fps: float | None) -> bool:
+    """Whether a probed frame rate is plausible (drivers and containers sometimes report 0 or 90000)."""
     return fps is not None and _MIN_SANE_FPS <= fps <= _MAX_SANE_FPS
 
 
 def _select_probed_fps(stream_info: dict[str, Any]) -> float | None:
     avg_fps = _parse_fps(stream_info.get("avg_frame_rate"))
-    if _is_sane_fps(avg_fps):
+    if is_sane_fps(avg_fps):
         return avg_fps
     r_fps = _parse_fps(stream_info.get("r_frame_rate"))
-    if _is_sane_fps(r_fps):
+    if is_sane_fps(r_fps):
         return r_fps
     return None
 
@@ -163,9 +167,8 @@ def probe_video(
 
 
 def ffmpeg_ingest_rtsp_args(url: str, transport: str, latency_ms: int | None) -> list[str]:
-    args = ffmpeg_rtsp_input_options(transport, latency_ms)
-    args += ["-i", url]
-    return args
+    """Return FFmpeg input arguments (options plus ``-i URL``) for an RTSP source."""
+    return [*ffmpeg_rtsp_input_options(transport, latency_ms), "-i", url]
 
 
 def ffmpeg_rtsp_input_options(transport: str, latency_ms: int | None) -> list[str]:

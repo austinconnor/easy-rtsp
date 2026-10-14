@@ -32,21 +32,21 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 
 __all__ = [
     "ConfigurationError",
-    "configure_logging",
-    "setup_cli_logging",
     "DependencyError",
     "EasyRtspError",
-    "get_logger",
     "ProcessingError",
-    "PublishError",
     "PublishDestination",
-    "build_rtsp_url",
-    "parse_publish_destination",
+    "PublishError",
     "SourceError",
     "Stream",
     "StreamConfig",
     "StreamState",
     "StreamStatus",
+    "build_rtsp_url",
+    "configure_logging",
+    "get_logger",
+    "parse_publish_destination",
+    "setup_cli_logging",
 ]
 
 try:

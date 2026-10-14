@@ -30,7 +30,7 @@ Returns the latest processed frame. The default defensive copy is safe to mutate
 
 ### `save_snapshot(path) -> Path`
 
-Encodes the latest frame with OpenCV and returns the resolved path. Raises `ProcessingError` until a frame is available.
+Encodes the latest frame with OpenCV and returns the resolved path. The file extension picks the format (`.png`, `.jpg`, `.bmp`, ...); a path without an extension is written as PNG. Raises `ProcessingError` until a frame is available or if OpenCV cannot encode the frame.
 
 ## Publishing
 
@@ -48,7 +48,7 @@ Waits for publishing to finish. Returns `False` when a finite timeout expires fi
 
 ### `stop() -> None`
 
-Stops FFmpeg children and the locally managed MediaMTX process.
+Stops FFmpeg children and the locally managed MediaMTX process. The publish thread gets a short grace period to finish cleanly (so MP4 recordings are finalized) before child processes are terminated. Safe to call more than once, from any thread, including from inside a `map()` transform.
 
 Streams are context managers:
 

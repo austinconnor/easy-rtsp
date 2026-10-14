@@ -45,7 +45,11 @@ Install it with:
 easy-rtsp install-backends
 ```
 
+`install-backends` downloads the latest release for your platform from GitHub and verifies its SHA-256 checksum before installing it.
+
 If it is not on `PATH`, set `EASY_RTSP_MEDIAMTX` to the executable.
+
+easy-rtsp starts MediaMTX with a minimal generated config that only enables the listeners it needs (RTSP, plus WebRTC when requested). Unused servers such as RTMP, HLS, SRT, and MoQ (MediaMTX 1.19+) stay off, so several local streams can run side by side on different `--server-port` values.
 
 ## Confirm the environment
 

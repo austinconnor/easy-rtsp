@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 import threading
 from collections.abc import Iterator
-from typing import Callable
+from contextlib import suppress
+from typing import cast
 
 import numpy as np
 
 from easy_rtsp.exceptions import DependencyError, SourceError
 from easy_rtsp.ffmpeg_util import resolve_ffmpeg
-from easy_rtsp.process_io import decode_tail_bytes, discard_process, start_tail_reader
+from easy_rtsp.process_io import (
+    decode_tail_bytes,
+    discard_process,
+    start_tail_reader,
+    terminate_process,
+)
 from easy_rtsp.serve_url import redact_credentials_in_text
+
+_EOF_EXIT_TIMEOUT_SEC = 5.0
 
 
 def _ffmpeg_exit_ok(returncode: int | None, stderr: str) -> bool:
@@ -21,11 +30,8 @@ def _ffmpeg_exit_ok(returncode: int | None, stderr: str) -> bool:
         return False
     if returncode in (0, -15, 255):
         return True
-    err = stderr.lower()
     # Closing the pipe early makes FFmpeg exit 1 with "Broken pipe" / mux errors — not a decode failure.
-    if returncode == 1 and "broken pipe" in err:
-        return True
-    return False
+    return returncode == 1 and "broken pipe" in stderr.lower()
 
 
 def iter_raw_bgr_frames(
@@ -33,7 +39,6 @@ def iter_raw_bgr_frames(
     width: int,
     height: int,
     *,
-    stderr_filter: Callable[[str], None] | None = None,
     proc_holder: list[subprocess.Popen[bytes]] | None = None,
     stop_event: threading.Event | None = None,
 ) -> Iterator[np.ndarray]:
@@ -61,34 +66,33 @@ def iter_raw_bgr_frames(
         proc.stderr,
         name="easy-rtsp-decode-stderr",
     )
+    stdout = cast(io.BufferedReader, proc.stdout)
     frame_bytes = width * height * 3
+    stopped_early = False
     try:
-        while True:
-            if stop_event is not None and stop_event.is_set():
+        while not (stop_event is not None and stop_event.is_set()):
+            # Read straight into a fresh array: one copy per frame, and callers may mutate it.
+            frame = np.empty((height, width, 3), dtype=np.uint8)
+            if stdout.readinto(frame.data) != frame_bytes:
                 break
-            buf = proc.stdout.read(frame_bytes)
-            if not buf or len(buf) < frame_bytes:
-                break
-            yield np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3)).copy()
+            yield frame
+    except GeneratorExit:
+        stopped_early = True
+        raise
     finally:
-        killed_by_us = bool(stop_event is not None and stop_event.is_set())
-        try:
+        stopped = stopped_early or bool(stop_event is not None and stop_event.is_set())
+        with suppress(OSError):
             proc.stdout.close()
-        except OSError:
-            pass
-        if proc.poll() is None:
-            proc.terminate()
-            killed_by_us = True
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-            killed_by_us = True
+        if not stopped:
+            # stdout hit EOF, so FFmpeg is exiting on its own; collect its real exit status.
+            try:
+                proc.wait(timeout=_EOF_EXIT_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                stopped = True
+        terminate_process(proc, timeout=10.0)
         stderr_thread.join(timeout=5.0)
         discard_process(proc_holder, proc)
-        err = redact_credentials_in_text(decode_tail_bytes(stderr_tail))
-        if not killed_by_us and not _ffmpeg_exit_ok(proc.returncode, err):
-            if stderr_filter:
-                stderr_filter(err)
-            raise SourceError(f"ffmpeg exited with code {proc.returncode}: {err[-4000:]}")
+        if not stopped:
+            err = redact_credentials_in_text(decode_tail_bytes(stderr_tail))
+            if not _ffmpeg_exit_ok(proc.returncode, err):
+                raise SourceError(f"ffmpeg exited with code {proc.returncode}: {err[-4000:]}")

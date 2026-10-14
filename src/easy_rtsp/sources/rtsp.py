@@ -46,6 +46,11 @@ class RtspSource:
         return self._config
 
     @property
+    def url(self) -> str:
+        """Source URL, including any credentials (use ``redact_url_credentials`` before logging)."""
+        return self._url
+
+    @property
     def reconnect_count(self) -> int:
         """How many reconnects have been scheduled after a disconnect or probe failure."""
         return self._reconnect_count
@@ -102,7 +107,7 @@ class RtspSource:
                     break
                 if not self._config.reconnect or self._reconnect_exhausted():
                     raise SourceError(f"RTSP probe failed for {safe_url!r}: {e}") from e
-                self._notify_reconnect("probe_failed")
+                self.record_reconnect("probe_failed")
                 continue
 
             w, h = probe.width, probe.height
@@ -138,7 +143,7 @@ class RtspSource:
                         f"RTSP decode failed for {safe_url!r} "
                         f"(reconnect_count={self._reconnect_count}): {e}"
                     ) from e
-                self._notify_reconnect("decode_failed")
+                self.record_reconnect("decode_failed")
                 continue
 
             if self._stop_event is not None and self._stop_event.is_set():
@@ -152,13 +157,10 @@ class RtspSource:
                     self._config.max_reconnect_attempts,
                 )
                 break
-            self._notify_reconnect("stream_ended")
+            self.record_reconnect("stream_ended")
 
     def _reconnect_exhausted(self) -> bool:
         m = self._config.max_reconnect_attempts
         if m is None:
             return False
         return self._reconnect_count >= m
-
-    def _notify_reconnect(self, reason: str) -> None:
-        self.record_reconnect(reason, sleep=True)

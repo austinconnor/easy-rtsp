@@ -4,31 +4,37 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 
 from easy_rtsp.config import StreamConfig
 from easy_rtsp.exceptions import DependencyError, SourceError
+from easy_rtsp.ffmpeg_util import VideoProbe, is_sane_fps
 from easy_rtsp.sources.base import ensure_bgr_uint8
 
 _DEFAULT_PROBE_TIMEOUT_SEC = 15.0
 
 
-def probe_webcam_dimensions(index: int, *, timeout_sec: float = _DEFAULT_PROBE_TIMEOUT_SEC) -> tuple[int, int]:
-    """
-    Return ``(width, height)`` for a camera index via OpenCV.
-
-    The probe runs in a thread with *timeout_sec* so a stuck driver does not hang forever.
-    """
+def _import_cv2() -> Any:
     try:
-        import cv2  # type: ignore[import-untyped]
+        import cv2
     except ImportError as e:
         raise DependencyError(
             "OpenCV (cv2) is required for webcam capture but could not be imported. "
             'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
         ) from e
+    return cv2
 
-    result: list[tuple[int, int]] = []
+
+def probe_webcam(index: int, *, timeout_sec: float = _DEFAULT_PROBE_TIMEOUT_SEC) -> VideoProbe:
+    """
+    Return the frame size and driver-reported FPS (``None`` if unknown) for a camera index.
+
+    The probe runs in a thread with *timeout_sec* so a stuck driver does not hang forever.
+    """
+    cv2 = _import_cv2()
+    result: list[VideoProbe] = []
     errors: list[BaseException] = []
 
     def _run() -> None:
@@ -44,7 +50,12 @@ def probe_webcam_dimensions(index: int, *, timeout_sec: float = _DEFAULT_PROBE_T
                     ok, sample = cap.read()
                     if ok and sample is not None and getattr(sample, "ndim", 0) >= 2:
                         h, w = int(sample.shape[0]), int(sample.shape[1])
-                result.append((max(w, 1), max(h, 1)))
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                result.append(
+                    VideoProbe(
+                        width=max(w, 1), height=max(h, 1), fps=fps if is_sane_fps(fps) else None
+                    )
+                )
             finally:
                 cap.release()
         except Exception as e:
@@ -61,8 +72,16 @@ def probe_webcam_dimensions(index: int, *, timeout_sec: float = _DEFAULT_PROBE_T
     if errors:
         raise errors[0]
     if not result:
-        raise SourceError(f"Could not read webcam dimensions for index {index}")
+        raise SourceError(f"Could not read webcam properties for index {index}")
     return result[0]
+
+
+def probe_webcam_dimensions(
+    index: int, *, timeout_sec: float = _DEFAULT_PROBE_TIMEOUT_SEC
+) -> tuple[int, int]:
+    """Return ``(width, height)`` for a camera index (see :func:`probe_webcam`)."""
+    probe = probe_webcam(index, timeout_sec=timeout_sec)
+    return probe.width, probe.height
 
 
 class WebcamSource:
@@ -77,15 +96,13 @@ class WebcamSource:
     def config(self) -> StreamConfig:
         return self._config
 
-    def frames(self) -> Iterator[np.ndarray]:
-        try:
-            import cv2  # type: ignore[import-untyped]
-        except ImportError as e:
-            raise DependencyError(
-                "OpenCV (cv2) is required for webcam capture but could not be imported. "
-                'Install with: pip install "easy-rtsp[webcam]" (or pip install opencv-python-headless).'
-            ) from e
+    @property
+    def index(self) -> int:
+        """OpenCV camera device index."""
+        return self._index
 
+    def frames(self) -> Iterator[np.ndarray]:
+        cv2 = _import_cv2()
         cap = cv2.VideoCapture(self._index)
         if not cap.isOpened():
             raise SourceError(f"Could not open webcam index {self._index}")

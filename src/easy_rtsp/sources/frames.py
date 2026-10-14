@@ -37,10 +37,7 @@ class FrameGeneratorSource:
 
     def frames(self) -> Iterator[np.ndarray]:
         it: Iterator[np.ndarray]
-        if callable(self._factory):
-            it = self._factory()
-        else:
-            it = iter(self._factory)
+        it = self._factory() if callable(self._factory) else iter(self._factory)
         w, h = self.size
         for frame in it:
             f = ensure_bgr_uint8(frame, context="FrameGeneratorSource")

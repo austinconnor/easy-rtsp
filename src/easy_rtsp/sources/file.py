@@ -30,6 +30,11 @@ class FileSource:
     def config(self) -> StreamConfig:
         return self._config
 
+    @property
+    def path(self) -> Path:
+        """Video file being decoded."""
+        return self._path
+
     def frames(self) -> Iterator[np.ndarray]:
         path_str = str(self._path.resolve())
         if self._cached_probe is not None:

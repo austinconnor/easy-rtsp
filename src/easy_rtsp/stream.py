@@ -4,41 +4,34 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import os
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from easy_rtsp.backend import (
-    MediaMTXProcess,
-    discover_lan_hosts,
-    tcp_port_is_available,
-    wait_for_tcp_listener,
-    write_minimal_mediamtx_config,
-)
+from easy_rtsp.backend import MediaMTXProcess, discover_lan_hosts, tcp_port_is_available
 from easy_rtsp.config import StreamConfig
-from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError, PublishError
+from easy_rtsp.exceptions import ConfigurationError, DependencyError, ProcessingError
 from easy_rtsp.ffmpeg_util import ffmpeg_rtsp_input_options, probe_video, resolve_mediamtx
 from easy_rtsp.install_backends import INSTALL_MEDIAMTX_CLI
+from easy_rtsp.log import get_logger
+from easy_rtsp.process_io import terminate_processes
 from easy_rtsp.publish import start_publish_thread, start_rtsp_passthrough_thread
 from easy_rtsp.serve_url import (
+    PublishDestination,
     build_rtsp_url,
     format_url_host,
     is_loopback_host,
     parse_publish_destination,
 )
-from easy_rtsp.sources.base import FrameSource, ensure_bgr_uint8
+from easy_rtsp.sources.base import ensure_bgr_uint8
 from easy_rtsp.sources.file import FileSource
 from easy_rtsp.sources.frames import FrameGeneratorSource
 from easy_rtsp.sources.rtsp import RtspSource
-from easy_rtsp.sources.webcam import WebcamSource, probe_webcam_dimensions
-from easy_rtsp.log import get_logger
+from easy_rtsp.sources.webcam import WebcamSource, probe_webcam
 from easy_rtsp.types import StreamState, StreamStatus
 
 _logger = get_logger("stream")
@@ -46,6 +39,21 @@ _logger = get_logger("stream")
 # Main-thread ``threading.Event.wait(None)`` can block delivery of ``KeyboardInterrupt`` on Windows;
 # polling with a short timeout keeps Ctrl+C responsive while ``wait()`` runs.
 _WAIT_POLL_SEC = 0.3
+# How long stop() lets the publish thread close FFmpeg's input (finalizing MP4/HLS side outputs)
+# before terminating whatever is still running, e.g. a decoder blocked on a stalled camera.
+_STOP_GRACE_SEC = 2.0
+_STOP_KILL_TIMEOUT_SEC = 2.0
+_STOP_JOIN_TIMEOUT_SEC = 10.0
+_DEFAULT_FPS = 30.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _PublishTarget:
+    """Where the publish thread sends encoded output; exactly one field is set."""
+
+    rtsp_push_url: str | None = None
+    srt_push_url: str | None = None
+    tcp_listen: tuple[str, int] | None = None
 
 
 class Stream:
@@ -85,20 +93,18 @@ class Stream:
         self._webrtc_play_url: str | None = None
         self._lan_viewer_urls: tuple[str, ...] = ()
         self._lan_webrtc_play_urls: tuple[str, ...] = ()
+        self._bind_source()
 
-        if hasattr(self._source, "_stop_event"):
-            self._source._stop_event = self._stop_event
-        if _is_rtsp_source(self._source):
-            self._source._on_reconnecting_internal = self._handle_reconnect_attempt
+    def __repr__(self) -> str:
+        source = type(self._source).__name__
+        return f"<Stream source={source} state={self._state.value} viewer_url={self._viewer_url!r}>"
 
-    def _handle_reconnect_attempt(self, attempt: int, _reason: str = "") -> None:
-        self._set_state(StreamState.RECONNECTING)
-        _logger.info("stream state -> reconnecting (attempt %s)", attempt)
+    # ------------------------------------------------------------------ properties
 
     @property
     def reconnect_count(self) -> int:
         """RTSP ingest reconnect counter (0 if the source is not RTSP)."""
-        if _is_rtsp_source(self._source):
+        if isinstance(self._source, RtspSource):
             return self._source.reconnect_count
         return 0
 
@@ -130,7 +136,7 @@ class Stream:
         """
         When easy-rtsp started **MediaMTX** locally with ``webrtc_enabled`` set, HTTP URL for **browser**
         playback (video only). Typically ``http://127.0.0.1:8889/<path>``. For phones on the same
-        network, replace the host with this machine's LAN IP. ``None`` if WebRTC was not enabled.
+        network, use :attr:`lan_webrtc_play_urls`. ``None`` if WebRTC was not enabled.
         """
         return self._webrtc_play_url
 
@@ -149,10 +155,12 @@ class Stream:
         with self._latest_frame_lock:
             latest_frame_available = self._latest_frame is not None
             last_frame_at = self._last_frame_at
-        last_reconnect_reason = self._source.last_reconnect_reason if _is_rtsp_source(self._source) else None
+        last_reconnect_reason = (
+            self._source.last_reconnect_reason if isinstance(self._source, RtspSource) else None
+        )
         alive_child_process_count = sum(
             1
-            for proc in self._config.ffmpeg_children
+            for proc in list(self._config.ffmpeg_children)
             if proc is not None and proc.poll() is None
         )
         if self._publish_started_at is None:
@@ -186,6 +194,8 @@ class Stream:
                 self._publish_thread is not None and self._publish_thread.is_alive()
             ),
         )
+
+    # ------------------------------------------------------------------ constructors
 
     @classmethod
     def open(cls, url: str, **kwargs: Any) -> Stream:
@@ -246,13 +256,16 @@ class Stream:
         cfg = _stream_config_from_kwargs(**kwargs)
         return cls(FrameGeneratorSource(factory, fps=fps, size=size, config=cfg), config=cfg)
 
+    # ------------------------------------------------------------------ processing
+
     def map(self, fn: Callable[[np.ndarray], np.ndarray | None]) -> Stream:
         """Return a new stream that applies *fn* to each frame (``None`` drops a frame)."""
+        inner = self._transform
 
         def composed(frame: np.ndarray) -> np.ndarray | None:
-            if self._transform is None:
+            if inner is None:
                 return fn(frame)
-            mid = self._transform(frame)
+            mid = inner(frame)
             if mid is None:
                 return None
             return fn(mid)
@@ -276,15 +289,15 @@ class Stream:
         """
         Save the latest processed frame to *path* and return the resolved destination path.
 
-        Uses OpenCV for image encoding when available. Raises a helpful error if no frame is
-        available yet or if OpenCV is not installed.
+        The image format follows the file extension (``.jpg``, ``.png``, ...). Requires OpenCV;
+        raises :class:`ProcessingError` if no frame is available yet.
         """
-        frame = self.latest_frame(copy=True)
+        frame = self.latest_frame(copy=False)
         if frame is None:
             raise ProcessingError("No frame available yet to save a snapshot")
 
         try:
-            import cv2  # type: ignore[import-untyped]
+            import cv2
         except ImportError as e:
             raise DependencyError(
                 "OpenCV (cv2) is required to save snapshots. "
@@ -292,18 +305,20 @@ class Stream:
             ) from e
 
         dest = Path(path).expanduser().resolve()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(dest), frame)
+        # cv2.imencode + write_bytes (instead of cv2.imwrite) handles non-ASCII paths on Windows.
+        try:
+            ok, encoded = cv2.imencode(dest.suffix or ".png", frame)
+        except cv2.error as e:
+            raise ProcessingError(f"Could not encode snapshot for {dest}: {e}") from e
         if not ok:
-            raise ProcessingError(f"Could not write snapshot to {dest}")
+            raise ProcessingError(f"Could not encode snapshot for {dest}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(encoded.tobytes())
         return dest
 
     def frames(self) -> Iterator[np.ndarray]:
-        """Iterate decoded or generated frames (BGR ``uint8``)."""
-        if hasattr(self._source, "_stop_event"):
-            self._source._stop_event = self._stop_event
-        if _is_rtsp_source(self._source):
-            self._source._on_reconnecting_internal = self._handle_reconnect_attempt
+        """Iterate decoded or generated frames (BGR ``uint8``) after any :meth:`map` transforms."""
+        self._bind_source()
         try:
             for frame in self._source.frames():
                 if self._stop_event.is_set():
@@ -327,7 +342,9 @@ class Stream:
                 try:
                     out = ensure_bgr_uint8(out, context="Stream frame")
                 except (AttributeError, ValueError) as e:
-                    raise ProcessingError(f"invalid frame returned by source or transform: {e}") from e
+                    raise ProcessingError(
+                        f"invalid frame returned by source or transform: {e}"
+                    ) from e
                 with self._latest_frame_lock:
                     self._latest_frame = out.copy()
                     self._last_frame_at = time.monotonic()
@@ -335,6 +352,8 @@ class Stream:
         finally:
             if not self._serve_started and self._state is not StreamState.ERROR:
                 self._set_state(StreamState.STOPPED)
+
+    # ------------------------------------------------------------------ publishing
 
     def serve(self, endpoint: str = "live", **kwargs: Any) -> Stream:
         """
@@ -346,7 +365,7 @@ class Stream:
         * a full ``rtsp://`` or ``rtsps://`` URL (userinfo is preserved for authenticated cameras)
         * an ``srt://`` URL (FFmpeg publishes MPEG-TS over SRT; no local MediaMTX RTSP startup)
 
-        On loopback RTSP, if the port is free: **MediaMTX** is started when ``mediamtx`` is on ``PATH``.
+        On loopback RTSP, if the port is free: **MediaMTX** is started when it is installed.
         If MediaMTX is missing, **FFmpeg** listens for **one** MPEG-TS client over **TCP** on the same
         host/port (open ``tcp://HOST:PORT`` in VLC). FFmpeg's RTSP muxer cannot reliably act as an RTSP
         server; use MediaMTX for ``rtsp://`` playback.
@@ -357,230 +376,68 @@ class Stream:
 
         When MediaMTX is started on loopback, set ``webrtc_enabled`` (default False) to turn on
         MediaMTX's WebRTC server; use :attr:`webrtc_play_url` for browser/mobile playback (no audio).
+
+        Keyword arguments override :class:`~easy_rtsp.config.StreamConfig` fields for this stream.
         """
-        if kwargs:
-            old_config = self._config
-            self._config = dataclasses.replace(
-                old_config,
-                **_stream_options_from_kwargs(**kwargs),
-            )
-            # Built-in sources read ingest/file behavior from their own config reference.
-            # Keep it aligned when serve-time overrides create a replacement dataclass.
-            if getattr(self._source, "config", None) is old_config and hasattr(
-                self._source, "_config"
-            ):
-                self._source._config = self._config
         if self._serve_started:
             raise ConfigurationError("serve() was already started on this Stream")
-
-        use_audio_passthrough = self._config.audio_mode == "passthrough"
-        self._webrtc_play_url = None
-        self._lan_viewer_urls = ()
-        self._lan_webrtc_play_urls = ()
+        if kwargs:
+            self._apply_config_overrides(kwargs)
+        config = self._config
+        use_audio_passthrough = config.audio_mode == "passthrough"
         if use_audio_passthrough:
             self._validate_audio_passthrough()
-        self._stop_event.clear()
-        dest = parse_publish_destination(endpoint, self._config)
-        if self._config.lan_access and not (
-            dest.scheme == "rtsp" and is_loopback_host(dest.host)
-        ):
+        dest = parse_publish_destination(endpoint, config)
+        if config.lan_access and not (dest.scheme == "rtsp" and is_loopback_host(dest.host)):
             raise ConfigurationError(
                 "lan_access only applies to a local RTSP shorthand or loopback rtsp:// URL"
             )
-        wants_side_outputs = bool(self._config.record_path or self._config.hls_output_dir)
+        wants_side_outputs = bool(config.record_path or config.hls_output_dir)
         if wants_side_outputs and dest.scheme == "srt":
             raise ConfigurationError(
                 "record_path and hls_output_dir require an RTSP publish destination"
             )
 
-        if hasattr(self._source, "_stop_event"):
-            self._source._stop_event = self._stop_event
-        if _is_rtsp_source(self._source):
-            self._source._on_reconnecting_internal = self._handle_reconnect_attempt
-
+        self._bind_source()
+        self._stop_event.clear()
+        self._wait_event.clear()
+        self._publish_error = None
+        config.ffmpeg_children.clear()
+        self._viewer_url = None
+        self._webrtc_play_url = None
+        self._lan_viewer_urls = ()
+        self._lan_webrtc_play_urls = ()
         self._set_state(StreamState.STARTING)
         try:
             if use_audio_passthrough:
-                w = h = 0
-                fps = 0.0
+                width, height, fps = 0, 0, 0.0
             else:
-                w, h, fps = self._infer_publish_params()
-
-            self._config.ffmpeg_children.clear()
-            self._publish_error = None
-            self._wait_event.clear()
-
-            tcp_mpegts_listen = False
-            rtsp_push_url: str | None = None
-            srt_push_url: str | None = None
-
-            if dest.scheme == "srt":
-                srt_push_url = dest.url
-            elif dest.scheme in ("rtsp", "rtsps"):
-                host, port, _path_name = dest.host, dest.port, dest.path_name
-                full_url = dest.url
-                if is_loopback_host(host):
-                    if tcp_port_is_available(host, port):
-                        mtx = resolve_mediamtx()
-                        if mtx:
-                            fd, tmp = tempfile.mkstemp(suffix=".yml", prefix="easy-rtsp-mediamtx-")
-                            os.close(fd)
-                            cfg_path = Path(tmp)
-                            try:
-                                extra_mtx_kwargs: dict[str, Any] = {}
-                                if self._config.webrtc_ice_port != 8189:
-                                    extra_mtx_kwargs["webrtc_ice_port"] = self._config.webrtc_ice_port
-                                write_minimal_mediamtx_config(
-                                    cfg_path,
-                                    _path_name,
-                                    port,
-                                    lan_access=self._config.lan_access,
-                                    listen_host=host,
-                                    webrtc_enabled=self._config.webrtc_enabled,
-                                    webrtc_http_port=self._config.webrtc_http_port,
-                                    **extra_mtx_kwargs,
-                                )
-                                self._backend = MediaMTXProcess.start(cfg_path)
-                                if not wait_for_tcp_listener(host, port):
-                                    self._stop_backend()
-                                    raise PublishError(
-                                        f"MediaMTX started but did not listen on {host}:{port} within 5s"
-                                    )
-                            except BaseException:
-                                with suppress(OSError):
-                                    cfg_path.unlink()
-                                raise
-                        else:
-                            if self._config.lan_access:
-                                raise DependencyError(
-                                    "LAN RTSP requires MediaMTX; the built-in fallback is not an RTSP "
-                                    f"server. Install it with: {INSTALL_MEDIAMTX_CLI}"
-                                )
-                            tcp_mpegts_listen = True
-                            _logger.warning(
-                                "MediaMTX is not installed or not on PATH. "
-                                "Using MPEG-TS over TCP at tcp://%s:%s (VLC: Media → Open Network Stream) "
-                                "instead of rtsp:// on this port. "
-                                "To install MediaMTX: %s",
-                                host,
-                                port,
-                                INSTALL_MEDIAMTX_CLI,
-                            )
-                    # else: assume an RTSP server is already bound on that port (client push mode)
-                if not tcp_mpegts_listen:
-                    rtsp_push_url = full_url
-            else:
-                raise ConfigurationError(f"Unsupported serve() scheme: {dest.scheme!r}")
-
-            if wants_side_outputs and tcp_mpegts_listen:
+                width, height, fps = self._infer_publish_params()
+            target = self._prepare_publish_target(dest)
+            if wants_side_outputs and target.tcp_listen is not None:
                 raise ConfigurationError(
                     "record_path and hls_output_dir need MediaMTX or an existing RTSP server; "
-                    f"the TCP fallback cannot create side outputs. Install MediaMTX with: "
+                    "the TCP fallback cannot create side outputs. Install MediaMTX with: "
                     f"{INSTALL_MEDIAMTX_CLI}"
                 )
-            if self._config.hls_output_dir:
-                Path(self._config.hls_output_dir).mkdir(parents=True, exist_ok=True)
-            if self._config.record_path:
-                Path(self._config.record_path).parent.mkdir(parents=True, exist_ok=True)
-        except BaseException:
-            if self._state is StreamState.STARTING:
-                self._set_state(StreamState.STOPPED)
-            raise
+            self._create_side_output_dirs()
 
-        self._publish_started_at = time.monotonic()
-        self._publish_ended_at = None
-        self._set_state(StreamState.RUNNING)
-        self._serve_started = True
-
-        def factory() -> Iterator[np.ndarray]:
-            return iter(self.frames())
-
-        def on_done(err: BaseException | None) -> None:
-            self._publish_ended_at = time.monotonic()
-            if self._stop_event.is_set():
-                err = None
-            self._publish_error = err
-            if err is not None:
-                _logger.error("publishing stopped with an error: %s", err)
-                self._set_state(StreamState.ERROR)
-            else:
-                self._set_state(StreamState.STOPPED)
-            self._wait_event.set()
-            self._stop_backend()
-
-        try:
+            self._publish_started_at = time.monotonic()
+            self._publish_ended_at = None
+            self._serve_started = True
+            self._set_state(StreamState.RUNNING)
             if use_audio_passthrough:
-                assert isinstance(self._source, RtspSource)
-
-                def _passthrough_reconnect(_attempt: int, reason: str) -> None:
-                    assert isinstance(self._source, RtspSource)
-                    self._source.record_reconnect(reason, sleep=True)
-
-                def _passthrough_running() -> None:
-                    if not self._stop_event.is_set() and self._state in (
-                        StreamState.STARTING,
-                        StreamState.RECONNECTING,
-                    ):
-                        self._set_state(StreamState.RUNNING)
-
-                self._publish_thread = start_rtsp_passthrough_thread(
-                    self._source._url,
-                    config=self._config,
-                    proc_holder=self._config.ffmpeg_children,
-                    stop_event=self._stop_event,
-                    on_done=on_done,
-                    on_reconnecting_attempt=_passthrough_reconnect,
-                    on_running=_passthrough_running,
-                    rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
-                    srt_push_url=srt_push_url,
-                    tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
-                )
+                self._publish_thread = self._start_passthrough(target)
             else:
-                self._publish_thread = start_publish_thread(
-                    factory,
-                    width=w,
-                    height=h,
-                    fps=fps,
-                    config=self._config,
-                    proc_holder=self._config.ffmpeg_children,
-                    stop_event=self._stop_event,
-                    on_done=on_done,
-                    rtsp_push_url=None if tcp_mpegts_listen else rtsp_push_url,
-                    srt_push_url=srt_push_url,
-                    tcp_listen=(dest.host, dest.port) if tcp_mpegts_listen else None,
-                )
-        except BaseException as e:
-            self._publish_ended_at = time.monotonic()
-            self._publish_error = e
+                self._publish_thread = self._start_publish(target, width, height, fps)
+        except BaseException:
             self._serve_started = False
-            self._set_state(StreamState.ERROR)
-            self._wait_event.set()
+            self._publish_started_at = None
             self._stop_backend()
+            self._set_state(StreamState.STOPPED)
             raise
-        if tcp_mpegts_listen:
-            self._viewer_url = f"tcp://{format_url_host(dest.host)}:{dest.port}"
-        else:
-            self._viewer_url = dest.url
 
-        if (
-            self._backend is not None
-            and dest.scheme in ("rtsp", "rtsps")
-            and self._config.webrtc_enabled
-        ):
-            self._webrtc_play_url = (
-                f"http://{format_url_host(dest.host)}:{self._config.webrtc_http_port}/{dest.path_name}"
-            )
-        if self._backend is not None and self._config.lan_access:
-            lan_hosts = discover_lan_hosts()
-            self._lan_viewer_urls = tuple(
-                f"rtsp://{format_url_host(host)}:{dest.port}/{dest.path_name}"
-                for host in lan_hosts
-            )
-            if self._config.webrtc_enabled:
-                self._lan_webrtc_play_urls = tuple(
-                    f"http://{format_url_host(host)}:{self._config.webrtc_http_port}/{dest.path_name}"
-                    for host in lan_hosts
-                )
+        self._record_viewer_urls(dest, target)
         return self
 
     def serve_rtsp(
@@ -634,50 +491,33 @@ class Stream:
         """Async wrapper for :meth:`wait` that avoids blocking the event loop."""
         return await asyncio.to_thread(self.wait, timeout)
 
-    def _stop_backend(self) -> None:
-        with self._backend_lock:
-            backend = self._backend
-            self._backend = None
-        if backend is not None:
-            backend.stop()
-
     def stop(self) -> None:
-        """Stop publishing and any MediaMTX instance started by this stream."""
+        """
+        Stop publishing and any MediaMTX instance started by this stream.
+
+        The publish thread first gets a short grace period to close FFmpeg's input so MP4 and HLS
+        side outputs are finalized; FFmpeg processes still running afterwards are terminated.
+        Safe to call more than once.
+        """
         self._stop_event.set()
-        self._set_state(StreamState.STOPPING)
-        children = list(self._config.ffmpeg_children)
-        for proc in children:
-            if proc is not None and proc.poll() is None:
-                stdin = getattr(proc, "stdin", None)
-                if stdin is not None:
-                    with suppress(OSError, ValueError):
-                        stdin.write(b"q\n")
-                        stdin.flush()
-                    with suppress(OSError, ValueError):
-                        stdin.close()
-        # Give FFmpeg a moment to flush trailers/exit, then terminate/hard-kill anything still running.
-        if children:
-            time.sleep(0.25)
-        for proc in children:
-            if proc is not None and proc.poll() is None:
-                with suppress(OSError):
-                    proc.terminate()
-        if children:
-            time.sleep(0.1)
-        for proc in children:
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        if self._state is not StreamState.STOPPED:
+            self._set_state(StreamState.STOPPING)
+        thread = self._publish_thread
+        # stop() may be called from a transform running on the publish thread itself.
+        joinable = thread is not None and thread is not threading.current_thread()
+        if joinable:
+            assert thread is not None
+            thread.join(timeout=_STOP_GRACE_SEC)
+        terminate_processes(list(self._config.ffmpeg_children), timeout=_STOP_KILL_TIMEOUT_SEC)
+        if joinable:
+            assert thread is not None
+            thread.join(timeout=_STOP_JOIN_TIMEOUT_SEC)
         self._stop_backend()
-        if self._publish_ended_at is None:
+        if self._publish_started_at is not None and self._publish_ended_at is None:
             self._publish_ended_at = time.monotonic()
-        if self._publish_thread and self._publish_thread.is_alive():
-            self._publish_thread.join(timeout=20.0)
+        self._config.ffmpeg_children.clear()
         self._set_state(StreamState.STOPPED)
         self._wait_event.set()
-        self._config.ffmpeg_children.clear()
 
     async def stop_async(self) -> None:
         """Async wrapper for :meth:`stop` that avoids blocking the event loop."""
@@ -689,44 +529,189 @@ class Stream:
     def __exit__(self, *args: object) -> None:
         self.stop()
 
+    # ------------------------------------------------------------------ internals
+
+    def _bind_source(self) -> None:
+        """Point built-in sources at this stream's stop event and reconnect hook."""
+        if hasattr(self._source, "_stop_event"):
+            self._source._stop_event = self._stop_event
+        if isinstance(self._source, RtspSource):
+            self._source._on_reconnecting_internal = self._handle_reconnect_attempt
+
+    def _apply_config_overrides(self, overrides: dict[str, Any]) -> None:
+        old_config = self._config
+        self._config = dataclasses.replace(old_config, **_stream_options_from_kwargs(**overrides))
+        # Built-in sources read ingest/file behavior from their own config reference; keep it aligned.
+        if getattr(self._source, "config", None) is old_config and hasattr(self._source, "_config"):
+            self._source._config = self._config
+
+    def _handle_reconnect_attempt(self, attempt: int, _reason: str = "") -> None:
+        self._set_state(StreamState.RECONNECTING)
+        _logger.info("stream state -> reconnecting (attempt %s)", attempt)
+
+    def _prepare_publish_target(self, dest: PublishDestination) -> _PublishTarget:
+        """Decide how FFmpeg publishes, starting a local MediaMTX server when appropriate."""
+        if dest.scheme == "srt":
+            return _PublishTarget(srt_push_url=dest.url)
+        local_port_free = is_loopback_host(dest.host) and tcp_port_is_available(
+            dest.host, dest.port, lan_access=self._config.lan_access
+        )
+        if not local_port_free:
+            # Remote server, or a server already listening locally: push to it as an RTSP client.
+            return _PublishTarget(rtsp_push_url=dest.url)
+        if dest.scheme == "rtsps":
+            raise ConfigurationError(
+                "rtsps:// on loopback needs an RTSPS server already listening on "
+                f"{dest.host}:{dest.port}; the MediaMTX instance easy-rtsp starts serves plain rtsp://"
+            )
+
+        mediamtx = resolve_mediamtx()
+        if mediamtx:
+            self._backend = MediaMTXProcess.launch(
+                path_name=dest.path_name,
+                host=dest.host,
+                port=dest.port,
+                lan_access=self._config.lan_access,
+                webrtc_enabled=self._config.webrtc_enabled,
+                webrtc_http_port=self._config.webrtc_http_port,
+                webrtc_ice_port=self._config.webrtc_ice_port,
+                binary=mediamtx,
+            )
+            return _PublishTarget(rtsp_push_url=dest.url)
+
+        if self._config.lan_access:
+            raise DependencyError(
+                "LAN RTSP requires MediaMTX; the built-in fallback is not an RTSP "
+                f"server. Install it with: {INSTALL_MEDIAMTX_CLI}"
+            )
+        _logger.warning(
+            "MediaMTX is not installed. Using MPEG-TS over TCP at tcp://%s:%s "
+            "(VLC: Media > Open Network Stream) instead of rtsp:// on this port. "
+            "To install MediaMTX: %s",
+            format_url_host(dest.host),
+            dest.port,
+            INSTALL_MEDIAMTX_CLI,
+        )
+        return _PublishTarget(tcp_listen=(dest.host, dest.port))
+
+    def _create_side_output_dirs(self) -> None:
+        if self._config.hls_output_dir:
+            Path(self._config.hls_output_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        if self._config.record_path:
+            Path(self._config.record_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+    def _start_publish(
+        self, target: _PublishTarget, width: int, height: int, fps: float
+    ) -> threading.Thread:
+        return start_publish_thread(
+            self.frames,
+            width=width,
+            height=height,
+            fps=fps,
+            config=self._config,
+            proc_holder=self._config.ffmpeg_children,
+            stop_event=self._stop_event,
+            on_done=self._on_publish_done,
+            rtsp_push_url=target.rtsp_push_url,
+            srt_push_url=target.srt_push_url,
+            tcp_listen=target.tcp_listen,
+        )
+
+    def _start_passthrough(self, target: _PublishTarget) -> threading.Thread:
+        assert isinstance(self._source, RtspSource)
+        return start_rtsp_passthrough_thread(
+            self._source.url,
+            config=self._config,
+            proc_holder=self._config.ffmpeg_children,
+            stop_event=self._stop_event,
+            on_done=self._on_publish_done,
+            on_reconnecting_attempt=self._on_passthrough_reconnect,
+            on_running=self._on_passthrough_running,
+            rtsp_push_url=target.rtsp_push_url,
+            srt_push_url=target.srt_push_url,
+            tcp_listen=target.tcp_listen,
+        )
+
+    def _on_passthrough_reconnect(self, _attempt: int, reason: str) -> None:
+        assert isinstance(self._source, RtspSource)
+        self._source.record_reconnect(reason, sleep=True)
+
+    def _on_passthrough_running(self) -> None:
+        if not self._stop_event.is_set() and self._state in (
+            StreamState.STARTING,
+            StreamState.RECONNECTING,
+        ):
+            self._set_state(StreamState.RUNNING)
+
+    def _on_publish_done(self, err: BaseException | None) -> None:
+        self._publish_ended_at = time.monotonic()
+        if self._stop_event.is_set():
+            err = None
+        self._publish_error = err
+        if err is not None:
+            _logger.error("publishing stopped with an error: %s", err)
+            self._set_state(StreamState.ERROR)
+        else:
+            self._set_state(StreamState.STOPPED)
+        self._wait_event.set()
+        self._stop_backend()
+
+    def _record_viewer_urls(self, dest: PublishDestination, target: _PublishTarget) -> None:
+        if target.tcp_listen is not None:
+            self._viewer_url = f"tcp://{format_url_host(dest.host)}:{dest.port}"
+        else:
+            self._viewer_url = dest.url
+        if self._backend is None:
+            return
+        webrtc_port = self._config.webrtc_http_port
+        if self._config.webrtc_enabled:
+            self._webrtc_play_url = (
+                f"http://{format_url_host(dest.host)}:{webrtc_port}/{dest.path_name}"
+            )
+        if self._config.lan_access:
+            lan_hosts = [format_url_host(host) for host in discover_lan_hosts()]
+            self._lan_viewer_urls = tuple(
+                f"rtsp://{host}:{dest.port}/{dest.path_name}" for host in lan_hosts
+            )
+            if self._config.webrtc_enabled:
+                self._lan_webrtc_play_urls = tuple(
+                    f"http://{host}:{webrtc_port}/{dest.path_name}" for host in lan_hosts
+                )
+
+    def _stop_backend(self) -> None:
+        with self._backend_lock:
+            backend = self._backend
+            self._backend = None
+        if backend is not None:
+            backend.stop()
+
     def _infer_publish_params(self) -> tuple[int, int, float]:
-        fps_default = float(self._config.fps) if self._config.fps is not None else 30.0
+        """Return ``(width, height, fps)`` for the encoder, probing the source when needed."""
+        configured_fps = float(self._config.fps) if self._config.fps is not None else None
         s = self._source
         if isinstance(s, FrameGeneratorSource):
             w, h = s.size
-            fps = float(self._config.fps) if self._config.fps is not None else s.fps
-            return w, h, fps
+            return w, h, configured_fps or s.fps
         if isinstance(s, FileSource):
-            p = probe_video(str(s._path.resolve()))
-            s._cached_probe = p
-            if self._config.fps is not None:
-                fps = float(self._config.fps)
-            else:
-                fps = p.fps if p.fps and p.fps > 0 else 30.0
-            return p.width, p.height, fps
-        if isinstance(s, RtspSource):
-            p = probe_video(
-                s._url,
+            probe = probe_video(str(s.path.resolve()))
+            s._cached_probe = probe
+        elif isinstance(s, RtspSource):
+            probe = probe_video(
+                s.url,
                 input_args=ffmpeg_rtsp_input_options(
-                    self._config.transport,
-                    self._config.latency_ms,
+                    self._config.transport, self._config.latency_ms
                 ),
             )
-            s._cached_probe = p
-            if self._config.fps is not None:
-                fps = float(self._config.fps)
-            else:
-                fps = p.fps if p.fps and p.fps > 0 else fps_default
-            return p.width, p.height, fps
-        if isinstance(s, WebcamSource):
-            w, h = probe_webcam_dimensions(s._index)
-            return w, h, fps_default
-        if isinstance(s, FrameSource) or callable(getattr(s, "frames", None)):
+            s._cached_probe = probe
+        elif isinstance(s, WebcamSource):
+            probe = probe_webcam(s.index)
+        else:
+            # Custom FrameSource: run_publish_loop takes the real size from the first frame.
             size = getattr(s, "size", None)
             if isinstance(size, tuple) and len(size) == 2:
-                return int(size[0]), int(size[1]), fps_default
-            return 1, 1, fps_default
-        raise ConfigurationError(f"Unsupported source type for publish: {type(s)!r}")
+                return int(size[0]), int(size[1]), configured_fps or _DEFAULT_FPS
+            return 1, 1, configured_fps or _DEFAULT_FPS
+        return probe.width, probe.height, configured_fps or probe.fps or _DEFAULT_FPS
 
     def _set_state(self, state: StreamState) -> None:
         self._state = state
@@ -753,7 +738,3 @@ def _stream_options_from_kwargs(**kwargs: Any) -> dict[str, Any]:
     if unknown:
         raise ConfigurationError(f"Unknown stream options: {sorted(unknown)}")
     return kwargs
-
-
-def _is_rtsp_source(source: Any) -> bool:
-    return isinstance(RtspSource, type) and isinstance(source, RtspSource)

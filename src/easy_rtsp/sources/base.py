@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator, Protocol, runtime_checkable
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -15,8 +16,7 @@ class FrameSource(Protocol):
     """Produces BGR ``uint8`` frames (HWC) and optional metadata."""
 
     @property
-    def config(self) -> StreamConfig:
-        ...
+    def config(self) -> StreamConfig: ...
 
     def frames(self) -> Iterator[np.ndarray]:
         """Yield decoded frames; each array has shape ``(H, W, 3)`` and dtype ``uint8``."""

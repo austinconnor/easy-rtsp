@@ -32,6 +32,7 @@ webcam = [
 ]
 dev = [
   "build>=1.2",
+  "mypy>=1.10",
   "pytest>=8.0",
   "pytest-cov>=4.0",
   "ruff>=0.8",
@@ -57,6 +58,22 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# Line length is left to the formatter; long string literals are kept intact.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/easy_rtsp"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["cv2"]
+ignore_missing_imports = true
 
 [tool.setuptools_scm]
 fallback_version = "0.0.0"

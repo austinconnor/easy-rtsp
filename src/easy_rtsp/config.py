@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from numbers import Real
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 from easy_rtsp.exceptions import ConfigurationError
 
@@ -106,8 +107,6 @@ class StreamConfig:
     """Internal: FFmpeg subprocesses (decode + encode) to terminate on :meth:`~easy_rtsp.stream.Stream.stop`."""
 
     def __deepcopy__(self, memo: dict[int, Any]) -> StreamConfig:
-        import copy
-
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
@@ -162,9 +161,9 @@ class StreamConfig:
             raise ConfigurationError("server_host must be non-empty")
         if not isinstance(self.lan_access, bool):
             raise ConfigurationError("lan_access must be a boolean")
-        _validate_port("server_port", self.server_port)
-        _validate_port("webrtc_http_port", self.webrtc_http_port)
-        _validate_port("webrtc_ice_port", self.webrtc_ice_port)
+        validate_port("server_port", self.server_port)
+        validate_port("webrtc_http_port", self.webrtc_http_port)
+        validate_port("webrtc_ice_port", self.webrtc_ice_port)
         if self.fps is not None and not _is_positive_number(self.fps):
             raise ConfigurationError("fps must be positive")
         if not _is_positive_number(self.hls_segment_time):
@@ -177,14 +176,19 @@ class StreamConfig:
             raise ConfigurationError("hls_list_size must be zero or positive")
 
 
-def _validate_port(name: str, value: int) -> None:
+def validate_port(name: str, value: object) -> None:
+    """Raise :class:`ConfigurationError` unless *value* is a TCP/UDP port number."""
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
         raise ConfigurationError(f"{name} must be an integer between 1 and 65535")
 
 
+def _is_real_number(value: object) -> TypeGuard[float]:
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
 def _is_nonnegative_number(value: object) -> bool:
-    return isinstance(value, Real) and not isinstance(value, bool) and value >= 0
+    return _is_real_number(value) and value >= 0
 
 
 def _is_positive_number(value: object) -> bool:
-    return isinstance(value, Real) and not isinstance(value, bool) and value > 0
+    return _is_real_number(value) and value > 0

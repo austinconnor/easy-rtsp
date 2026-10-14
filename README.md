@@ -92,7 +92,7 @@ easy-rtsp --version
 easy-rtsp install-backends
 ```
 
-Shared `--serve` flags include endpoint, transport (relay), reconnect options, `--server-host` / `--server-port`, `--lan`, `--low-latency-input`, `--record`, `--hls-dir`, `--hls-segment-time`, `--video-encoder`, `--audio-mode`, `--webrtc` / `--no-webrtc`, `--webrtc-port`, and `-v`.
+Every publishing command accepts `--serve`, `--server-host` / `--server-port`, `--lan`, `--webrtc` / `--no-webrtc`, `--record`, `--hls-dir`, `--fps`, `--video-encoder`, `--bitrate`, `--preset`, and `-v`. `relay` adds `--transport`, `--latency-ms`, reconnect options, and `--audio-mode`; `file` adds `--loop` / `--no-loop` and `--no-realtime`. See the [CLI reference](https://austinconnor.github.io/easy-rtsp/reference/cli/) for the full list.
 
 Logs go to **stderr**. `Play:` and `WebRTC:` URLs go to **stdout**. `SIGINT` is wired so `Ctrl+C` calls `stop()` reliably on Windows. CLI commands return a non-zero exit code and print FFmpeg's useful error tail when publishing fails.
 

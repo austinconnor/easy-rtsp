@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from ipaddress import ip_address
 from urllib.parse import quote, urlparse, urlunparse
 
-from easy_rtsp.config import StreamConfig
+from easy_rtsp.config import StreamConfig, validate_port
 from easy_rtsp.exceptions import ConfigurationError
 
 _CREDENTIAL_URL_RE = re.compile(
@@ -68,7 +68,7 @@ def build_rtsp_url(
         if password is not None:
             userinfo += f":{quote(password, safe='')}"
         userinfo += "@"
-    netloc = f"{userinfo}{_format_url_host(host)}:{port}"
+    netloc = f"{userinfo}{format_url_host(host)}:{port}"
     return urlunparse((scheme, netloc, path_clean, "", query_part, ""))
 
 
@@ -92,7 +92,7 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         host = config.server_host
         port = _validate_port(config.server_port, context="server_port")
         path = quote(path, safe="/%")
-        url = f"rtsp://{_format_url_host(host)}:{port}/{path}"
+        url = f"rtsp://{format_url_host(host)}:{port}/{path}"
         if query_part:
             url = f"{url}?{query_part}"
         return PublishDestination(url=url, host=host, port=port, path_name=path, scheme="rtsp")
@@ -103,8 +103,8 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         raise ConfigurationError(f"Invalid publish URL: {redact_url_credentials(raw)!r}") from e
     scheme = (u.scheme or "").lower()
     if scheme in ("rtsp", "rtsps"):
-        host = u.hostname
-        if not host:
+        rtsp_host = u.hostname
+        if not rtsp_host:
             raise ConfigurationError("RTSP URL must include a host or use a shorthand like 'live'")
         try:
             parsed_port = u.port
@@ -124,11 +124,13 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         if not netloc:
             raise ConfigurationError("RTSP URL must include a host (netloc)")
         full = urlunparse((scheme, netloc, path_clean, u.params, u.query, u.fragment))
-        return PublishDestination(url=full, host=host, port=port, path_name=path_name, scheme=scheme)
+        return PublishDestination(
+            url=full, host=rtsp_host, port=port, path_name=path_name, scheme=scheme
+        )
 
     if scheme == "srt":
-        host = u.hostname
-        if not host:
+        srt_host = u.hostname
+        if not srt_host:
             raise ConfigurationError("SRT URL must include a host")
         try:
             parsed_port = u.port
@@ -138,9 +140,9 @@ def parse_publish_destination(spec: str, config: StreamConfig) -> PublishDestina
         if parsed_port is None:
             userinfo, separator, _hostinfo = u.netloc.rpartition("@")
             prefix = f"{userinfo}@" if separator else ""
-            netloc = f"{prefix}{_format_url_host(host)}:{port}"
+            netloc = f"{prefix}{format_url_host(srt_host)}:{port}"
             raw = urlunparse((scheme, netloc, u.path, u.params, u.query, u.fragment))
-        return PublishDestination(url=raw, host=host, port=port, path_name="", scheme="srt")
+        return PublishDestination(url=raw, host=srt_host, port=port, path_name="", scheme="srt")
 
     raise ConfigurationError(
         f"Unsupported URL scheme for serve(): {scheme!r} (use rtsp://, rtsps://, or srt://)"
@@ -183,16 +185,11 @@ def redact_credentials_in_text(text: str) -> str:
 
 
 def format_url_host(host: str) -> str:
-    """Return a hostname suitable for an URL authority, bracketing IPv6 literals."""
-    return _format_url_host(host)
-
-
-def _format_url_host(host: str) -> str:
+    """Return a hostname suitable for a URL authority, bracketing IPv6 literals."""
     clean = host.strip().strip("[]")
     return f"[{clean}]" if ":" in clean else clean
 
 
 def _validate_port(value: int, *, context: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
-        raise ConfigurationError(f"{context} must be an integer between 1 and 65535")
+    validate_port(context, value)
     return value

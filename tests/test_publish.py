@@ -315,9 +315,7 @@ def test_publish_broken_pipe_after_first_frame_raises_publish_error() -> None:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdin.write.side_effect = [None, BrokenPipeError("broken pipe")]
-        mock_proc.stderr = BytesIO(
-            b"rtsp://user:secret@127.0.0.1:8554/live: 401 Unauthorized"
-        )
+        mock_proc.stderr = BytesIO(b"rtsp://user:secret@127.0.0.1:8554/live: 401 Unauthorized")
         mock_proc.poll.return_value = 1
         mock_proc.wait.return_value = 1
         p.return_value = mock_proc

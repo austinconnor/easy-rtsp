@@ -1,43 +1,23 @@
 # Roadmap
 
-## v0.1.2
+## Shipped in v0.1.x
 
-Focus: observability, capture ergonomics, and scoped RTSP relay improvements.
-
-- Snapshot API
-  - Add access to the latest processed frame.
-  - Add a convenience method for saving a snapshot to disk.
-  - Keep snapshot behavior aligned with transformed output, not raw source frames.
-
-- Health and status API
-  - Add a public status object that reports stream state, serve state, reconnect count, viewer URLs, and publish error state.
-  - Expand the first iteration with practical metrics like dropped frames, last-frame timing, publish uptime, child-process health, and reconnect reason.
-
-- Auth/config ergonomics
-  - Add helpers for building authenticated RTSP ingest and publish URLs safely.
-  - Preserve the existing URL-first API for advanced use cases.
-
-- Async-friendly wrappers
-  - Add thin async wrappers around blocking lifecycle calls so services can integrate without blocking an event loop.
-
-- Scoped audio support
-  - Add `audio_mode="passthrough"` for RTSP relay when no frame transform is applied.
-  - Keep unsupported combinations explicit rather than silently pretending audio works.
-
-- Reliability follow-through
-  - Extend tests around lifecycle transitions and state reporting.
-  - Keep CI focused on lightweight, deterministic checks.
+- Snapshot API (`latest_frame()`, `save_snapshot()`) aligned with transformed output.
+- Health and status API (`status()`) with reconnect, frame timing, and publish error details.
+- Authenticated URL helpers (`build_rtsp_url`, `serve_rtsp`) with credential redaction in logs and errors.
+- Async wrappers for blocking lifecycle calls.
+- `audio_mode="passthrough"` for untransformed RTSP relay.
+- Checksum-verified `install-backends`, typed codebase (mypy), and lifecycle tests.
 
 ## v0.2.0
 
 Focus: broader audio-aware publishing.
 
-- Build on the scoped relay-audio path from v0.1.2.
+- Build on the scoped relay-audio path shipped in v0.1.x.
 - Extend beyond relay passthrough only where the pipeline can support it honestly.
 
 - Proposed API shape
-  - Add `audio_mode` to `StreamConfig` with values like `off` and `passthrough`.
-  - Default to `off` in v0.1.x and `passthrough` opt-in for relay in v0.2.0.
+  - Keep `audio_mode` on `StreamConfig` (`off` by default, `passthrough` opt-in) and extend it only where supported.
   - Raise a clear configuration error when audio is requested for sources that do not support it yet.
 
 - Files likely to change
